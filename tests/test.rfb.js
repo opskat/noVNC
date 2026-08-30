@@ -1505,6 +1505,37 @@ describe('Remote Frame Buffer protocol client', function () {
                 client._sock._websocket._getSentData();
             });
 
+            it('should negotiate every public RSA-AES wire type', function () {
+                const variants = [
+                    [5, 'RA2', 128, true],
+                    [6, 'RA2ne', 128, false],
+                    [13, 'RA2r', 128, true],
+                    [129, 'RA2_256', 256, true],
+                    [130, 'RA2ne_256', 256, false],
+                    [133, 'RA2r_256', 256, true],
+                ];
+
+                for (const [type, name, aesBits, sessionEncrypted] of variants) {
+                    const variantClient = makeRFB();
+                    variantClient._rfbConnectionState = 'connecting';
+                    sendVer('003.008\n', variantClient);
+                    variantClient._sock._websocket._getSentData();
+                    sendSecurity(type, variantClient);
+
+                    expect(variantClient._sock).to.have.sent(new Uint8Array([type]));
+                    expect(variantClient._rfbAuthScheme).to.equal(type);
+                    expect(variantClient._rfbNegotiatedSecurity).to.equal(null);
+                    expect(variantClient._rfbRSAAESAuthenticationState.securityDetails)
+                        .to.deep.equal({
+                            type,
+                            name,
+                            authenticationEncrypted: true,
+                            sessionEncrypted,
+                            aesBits,
+                        });
+                }
+            });
+
             it('should respect server preference order', function () {
                 const authSchemes = [ 6, 79, 30, 188, 16, 6, 1 ];
                 client._sock._websocket._receiveData(new Uint8Array(authSchemes));
@@ -2390,6 +2421,16 @@ describe('Remote Frame Buffer protocol client', function () {
                     expect(client._sock).to.have.sent(new Uint8Array([0, 0, 0, 2]));
                     expect(client._negotiateStdVNCAuth).to.have.been.calledOnce;
                     expect(client._rfbAuthScheme).to.equal(2);
+                });
+
+                it('should keep Tight UnixLogon distinct from top-level RA2_256', function () {
+                    sendNumStrPairs([[0, 'TGHT', 'NOTUNNEL']], client);
+                    client._sock._websocket._getSentData();
+                    sendNumStrPairs([[129, 'TGHT', 'ULGNAUTH']], client);
+
+                    expect(client._sock).to.have.sent(new Uint8Array([0, 0, 0, 129]));
+                    expect(client._rfbAuthScheme).to.equal('TightUnixLogon');
+                    expect(client._rfbRSAAESAuthenticationState).to.equal(null);
                 });
 
                 it('should fail if there are no supported auth types', function () {

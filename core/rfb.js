@@ -59,15 +59,21 @@ const DOUBLE_TAP_THRESHOLD = 50;
 // Security types
 const securityTypeNone              = 1;
 const securityTypeVNCAuth           = 2;
+const securityTypeRA2               = 5;
 const securityTypeRA2ne             = 6;
+const securityTypeRA2r              = 13;
 const securityTypeTight             = 16;
 const securityTypeVeNCrypt          = 19;
 const securityTypeXVP               = 22;
 const securityTypeARD               = 30;
 const securityTypeMSLogonII         = 113;
+const securityTypeRA2256            = 129;
+const securityTypeRA2ne256          = 130;
+const securityTypeRA2r256           = 133;
 
-// Special Tight security types
-const securityTypeUnixLogon         = 129;
+// Tight sub-authentication states are internal and must not overlap with
+// top-level RFB security type 129 (RA2_256).
+const securityTypeTightUnixLogon    = 'TightUnixLogon';
 
 // VeNCrypt security types
 const securityTypePlain             = 256;
@@ -127,6 +133,7 @@ export default class RFB extends EventTargetMixin {
         this._rfbAuthScheme = -1;
         this._rfbCleanDisconnect = true;
         this._rfbRSAAESAuthenticationState = null;
+        this._rfbNegotiatedSecurity = null;
 
         // Server capabilities
         this._rfbVersion = 0;
@@ -1557,12 +1564,17 @@ export default class RFB extends EventTargetMixin {
         const clientTypes = [
             securityTypeNone,
             securityTypeVNCAuth,
+            securityTypeRA2,
             securityTypeRA2ne,
+            securityTypeRA2r,
             securityTypeTight,
             securityTypeVeNCrypt,
             securityTypeXVP,
             securityTypeARD,
             securityTypeMSLogonII,
+            securityTypeRA2256,
+            securityTypeRA2ne256,
+            securityTypeRA2r256,
             securityTypePlain,
         ];
 
@@ -1983,7 +1995,7 @@ export default class RFB extends EventTargetMixin {
                         this._rfbAuthScheme = securityTypeVNCAuth;
                         return true;
                     case 'TGHTULGNAUTH':
-                        this._rfbAuthScheme = securityTypeUnixLogon;
+                        this._rfbAuthScheme = securityTypeTightUnixLogon;
                         return true;
                     default:
                         return this._fail("Unsupported tiny auth scheme " +
@@ -2003,31 +2015,39 @@ export default class RFB extends EventTargetMixin {
         this.dispatchEvent(event);
     }
 
-    _negotiateRA2neAuth() {
+    _negotiateRSAAESAuth() {
         if (this._rfbRSAAESAuthenticationState === null) {
-            this._rfbRSAAESAuthenticationState = new RSAAESAuthenticationState(this._sock, () => this._rfbCredentials);
+            this._rfbRSAAESAuthenticationState = new RSAAESAuthenticationState(
+                this._sock, () => this._rfbCredentials, this._rfbAuthScheme);
             this._rfbRSAAESAuthenticationState.addEventListener(
                 "serververification", this._eventHandlers.handleRSAAESServerVerification);
             this._rfbRSAAESAuthenticationState.addEventListener(
                 "credentialsrequired", this._eventHandlers.handleRSAAESCredentialsRequired);
         }
-        this._rfbRSAAESAuthenticationState.checkInternalEvents();
-        if (!this._rfbRSAAESAuthenticationState.hasStarted) {
-            this._rfbRSAAESAuthenticationState.negotiateRA2neAuthAsync()
+        const state = this._rfbRSAAESAuthenticationState;
+        state.checkInternalEvents();
+        if (!state.hasStarted) {
+            state.negotiateAuthAsync()
+                .then(() => {
+                    if (this._rfbConnectionState === 'connecting') {
+                        this._rfbNegotiatedSecurity = state.securityDetails;
+                        this._rfbInitState = "SecurityResult";
+                        this._resumeAuthentication();
+                    }
+                })
                 .catch((e) => {
                     if (e.message !== "disconnect normally") {
                         this._fail(e.message);
                     }
                 })
-                .then(() => {
-                    this._rfbInitState = "SecurityResult";
-                    return true;
-                }).finally(() => {
-                    this._rfbRSAAESAuthenticationState.removeEventListener(
+                .finally(() => {
+                    state.removeEventListener(
                         "serververification", this._eventHandlers.handleRSAAESServerVerification);
-                    this._rfbRSAAESAuthenticationState.removeEventListener(
+                    state.removeEventListener(
                         "credentialsrequired", this._eventHandlers.handleRSAAESCredentialsRequired);
-                    this._rfbRSAAESAuthenticationState = null;
+                    if (this._rfbRSAAESAuthenticationState === state) {
+                        this._rfbRSAAESAuthenticationState = null;
+                    }
                 });
         }
         return false;
@@ -2104,11 +2124,16 @@ export default class RFB extends EventTargetMixin {
             case securityTypePlain:
                 return this._negotiatePlainAuth();
 
-            case securityTypeUnixLogon:
+            case securityTypeTightUnixLogon:
                 return this._negotiateTightUnixAuth();
 
+            case securityTypeRA2:
             case securityTypeRA2ne:
-                return this._negotiateRA2neAuth();
+            case securityTypeRA2r:
+            case securityTypeRA2256:
+            case securityTypeRA2ne256:
+            case securityTypeRA2r256:
+                return this._negotiateRSAAESAuth();
 
             case securityTypeMSLogonII:
                 return this._negotiateMSLogonIIAuth();
