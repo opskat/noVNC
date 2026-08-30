@@ -1,43 +1,7 @@
 import { encodeUTF8 } from './util/strings.js';
 import EventTargetMixin from './util/eventtarget.js';
 import legacyCrypto from './crypto/crypto.js';
-
-class RA2Cipher {
-    constructor() {
-        this._cipher = null;
-        this._counter = new Uint8Array(16);
-    }
-
-    async setKey(key) {
-        this._cipher = await legacyCrypto.importKey(
-            "raw", key, { name: "AES-EAX" }, false, ["encrypt, decrypt"]);
-    }
-
-    async makeMessage(message) {
-        const ad = new Uint8Array([(message.length & 0xff00) >>> 8, message.length & 0xff]);
-        const encrypted = await legacyCrypto.encrypt({
-            name: "AES-EAX",
-            iv: this._counter,
-            additionalData: ad,
-        }, this._cipher, message);
-        for (let i = 0; i < 16 && this._counter[i]++ === 255; i++);
-        const res = new Uint8Array(message.length + 2 + 16);
-        res.set(ad);
-        res.set(encrypted, 2);
-        return res;
-    }
-
-    async receiveMessage(length, encrypted) {
-        const ad = new Uint8Array([(length & 0xff00) >>> 8, length & 0xff]);
-        const res = await legacyCrypto.decrypt({
-            name: "AES-EAX",
-            iv: this._counter,
-            additionalData: ad,
-        }, this._cipher, encrypted);
-        for (let i = 0; i < 16 && this._counter[i]++ === 255; i++);
-        return res;
-    }
-}
+import RA2RecordCipher from './ra2_cipher.js';
 
 export default class RSAAESAuthenticationState extends EventTargetMixin {
     constructor(sock, getCredentials) {
@@ -220,9 +184,9 @@ export default class RSAAESAuthenticationState extends EventTargetMixin {
         clientSessionKey = new Uint8Array(clientSessionKey).slice(0, 16);
         serverSessionKey = await window.crypto.subtle.digest("SHA-1", serverSessionKey);
         serverSessionKey = new Uint8Array(serverSessionKey).slice(0, 16);
-        const clientCipher = new RA2Cipher();
+        const clientCipher = new RA2RecordCipher();
         await clientCipher.setKey(clientSessionKey);
-        const serverCipher = new RA2Cipher();
+        const serverCipher = new RA2RecordCipher();
         await serverCipher.setKey(serverSessionKey);
 
         // 6: Compute and exchange hashes
@@ -236,14 +200,15 @@ export default class RSAAESAuthenticationState extends EventTargetMixin {
         clientHash = await window.crypto.subtle.digest("SHA-1", clientHash);
         serverHash = new Uint8Array(serverHash);
         clientHash = new Uint8Array(clientHash);
-        this._sock.sQpushBytes(await clientCipher.makeMessage(clientHash));
+        this._sock.sQpushBytes(await clientCipher.seal(clientHash));
         this._sock.flush();
         await this._waitSockAsync(2 + 20 + 16);
-        if (this._sock.rQshift16() !== 20) {
+        const serverHashLength = this._sock.rQpeekBytes(2);
+        if (serverHashLength[0] !== 0 || serverHashLength[1] !== 20) {
             throw new Error("RA2: wrong server hash");
         }
-        const serverHashReceived = await serverCipher.receiveMessage(
-            20, this._sock.rQshiftBytes(20 + 16));
+        const serverHashReceived = await serverCipher.open(
+            this._sock.rQshiftBytes(2 + 20 + 16));
         if (serverHashReceived === null) {
             throw new Error("RA2: failed to authenticate the message");
         }
@@ -255,11 +220,12 @@ export default class RSAAESAuthenticationState extends EventTargetMixin {
 
         // 7: Receive subtype
         await this._waitSockAsync(2 + 1 + 16);
-        if (this._sock.rQshift16() !== 1) {
+        const subtypeLength = this._sock.rQpeekBytes(2);
+        if (subtypeLength[0] !== 0 || subtypeLength[1] !== 1) {
             throw new Error("RA2: wrong subtype");
         }
-        let subtype = (await serverCipher.receiveMessage(
-            1, this._sock.rQshiftBytes(1 + 16)));
+        let subtype = (await serverCipher.open(
+            this._sock.rQshiftBytes(2 + 1 + 16)));
         if (subtype === null) {
             throw new Error("RA2: failed to authenticate the message");
         }
@@ -298,7 +264,7 @@ export default class RSAAESAuthenticationState extends EventTargetMixin {
         for (let i = 0; i < password.length; i++) {
             credentials[username.length + 2 + i] = password.charCodeAt(i);
         }
-        this._sock.sQpushBytes(await clientCipher.makeMessage(credentials));
+        this._sock.sQpushBytes(await clientCipher.seal(credentials));
         this._sock.flush();
     }
 
