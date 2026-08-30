@@ -115,6 +115,10 @@ protocol stream.
 [`disconnect`](#disconnect)
   - The `disconnect` event is fired when the `RFB` object disconnects.
 
+[`negotiatedsecurity`](#negotiatedsecurity)
+  - The `negotiatedsecurity` event is fired once authentication has
+    succeeded, before the connection is fully established.
+
 [`securityfailure`](#securityfailure)
   - The `securityfailure` event is fired when the security negotiation
     with the server fails.
@@ -223,6 +227,16 @@ new RFB(target, urlOrChannel, options);
       - A `DOMString` specifying the ID to provide to any VNC repeater
         encountered.
 
+    `securityPolicy`
+      - An ordered `Array` of preference groups, where each group is an
+        `Array` of numeric RFB security types. The first group containing a
+        server-offered supported type is selected, preserving server order
+        within that group. Omitting this option or supplying an empty array
+        preserves unrestricted server-order negotiation. If no offered type
+        matches a non-empty policy, the connection fails instead of falling
+        back outside the policy. RFB 3.3 servers choose the security type, and
+        the client rejects a server-selected type outside a non-empty policy.
+
     `wsProtocols`
       - An `Array` of `DOMString`s specifying the sub-protocols to use
         in the WebSocket connection. Empty by default.
@@ -276,6 +290,23 @@ terminated. The `detail` property is an `Object` that contains the
 property `clean`. `clean` is a `boolean` indicating if the termination
 was clean or not. In the event of an unexpected termination or an error
 `clean` will be set to false.
+
+#### negotiatedsecurity
+
+The `negotiatedsecurity` event is fired exactly once after authentication
+succeeds and before the [`connect`](#connect) event. The `detail` property
+reports the security type actually negotiated, not the configured preference:
+
+| Property | Type        | Description
+| -------- | ----------- | -----------
+| `type` | `long` | Numeric top-level RFB security type selected on the wire
+| `name` | `DOMString` | Stable protocol name, such as `None`, `VNCAuth`, `Tight`, `RA2`, `RA2ne`, `RA2r`, `RA2_256`, `RA2ne_256`, or `RA2r_256`
+| `authenticationEncrypted` | `boolean` | Whether authentication credentials were cryptographically protected
+| `sessionEncrypted` | `boolean` | Whether the post-authentication RFB transport is encrypted
+| `aesBits` | `long` | AES key size for RSA-AES security types; omitted for other types
+
+Top-level type 129 is reported as `RA2_256`. Tight UnixLogon remains a Tight
+subtype and is reported using top-level type 16 with the name `Tight`.
 
 #### securityfailure
 

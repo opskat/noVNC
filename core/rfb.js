@@ -71,6 +71,44 @@ const securityTypeRA2256            = 129;
 const securityTypeRA2ne256          = 130;
 const securityTypeRA2r256           = 133;
 
+const SECURITY_TYPE_DETAILS = {
+    [securityTypeNone]: {
+        name: 'None',
+        authenticationEncrypted: false,
+        sessionEncrypted: false,
+    },
+    [securityTypeVNCAuth]: {
+        name: 'VNCAuth',
+        authenticationEncrypted: false,
+        sessionEncrypted: false,
+    },
+    [securityTypeTight]: {
+        name: 'Tight',
+        authenticationEncrypted: false,
+        sessionEncrypted: false,
+    },
+    [securityTypeVeNCrypt]: {
+        name: 'VeNCrypt',
+        authenticationEncrypted: false,
+        sessionEncrypted: false,
+    },
+    [securityTypeXVP]: {
+        name: 'XVP',
+        authenticationEncrypted: false,
+        sessionEncrypted: false,
+    },
+    [securityTypeARD]: {
+        name: 'ARD',
+        authenticationEncrypted: true,
+        sessionEncrypted: false,
+    },
+    [securityTypeMSLogonII]: {
+        name: 'MSLogonII',
+        authenticationEncrypted: true,
+        sessionEncrypted: false,
+    },
+};
+
 // Tight sub-authentication states are internal and must not overlap with
 // top-level RFB security type 129 (RA2_256).
 const securityTypeTightUnixLogon    = 'TightUnixLogon';
@@ -126,14 +164,18 @@ export default class RFB extends EventTargetMixin {
         this._shared = 'shared' in options ? !!options.shared : true;
         this._repeaterID = options.repeaterID || '';
         this._wsProtocols = options.wsProtocols || [];
+        this._securityPolicy = options.securityPolicy === undefined ? null :
+            options.securityPolicy.map(group => Array.from(group));
 
         // Internal state
         this._rfbConnectionState = '';
         this._rfbInitState = '';
         this._rfbAuthScheme = -1;
+        this._rfbSecurityType = -1;
         this._rfbCleanDisconnect = true;
         this._rfbRSAAESAuthenticationState = null;
         this._rfbNegotiatedSecurity = null;
+        this._rfbNegotiatedSecurityDispatched = false;
 
         // Server capabilities
         this._rfbVersion = 0;
@@ -1581,6 +1623,22 @@ export default class RFB extends EventTargetMixin {
         return clientTypes.includes(type);
     }
 
+    _selectSecurityType(types) {
+        if (this._securityPolicy === null || this._securityPolicy.length === 0) {
+            return types.find(type => this._isSupportedSecurityType(type)) ?? -1;
+        }
+
+        for (const group of this._securityPolicy) {
+            const type = types.find(type => group.includes(type) &&
+                                      this._isSupportedSecurityType(type));
+            if (type !== undefined) {
+                return type;
+            }
+        }
+
+        return -1;
+    }
+
     _negotiateSecurity() {
         if (this._rfbVersion >= 3.7) {
             // Server sends supported list, client decides
@@ -1597,20 +1655,16 @@ export default class RFB extends EventTargetMixin {
             const types = this._sock.rQshiftBytes(numTypes);
             Log.Debug("Server security types: " + types);
 
-            // Look for a matching security type in the order that the
-            // server prefers
-            this._rfbAuthScheme = -1;
-            for (let type of types) {
-                if (this._isSupportedSecurityType(type)) {
-                    this._rfbAuthScheme = type;
-                    break;
-                }
-            }
+            this._rfbAuthScheme = this._selectSecurityType(types);
 
             if (this._rfbAuthScheme === -1) {
+                if (this._securityPolicy !== null && this._securityPolicy.length > 0) {
+                    return this._fail("Unsupported security policy (types: " + types + ")");
+                }
                 return this._fail("Unsupported security types (types: " + types + ")");
             }
 
+            this._rfbSecurityType = this._rfbAuthScheme;
             this._sock.sQpush8(this._rfbAuthScheme);
             this._sock.flush();
         } else {
@@ -1624,6 +1678,13 @@ export default class RFB extends EventTargetMixin {
                 this._securityStatus = 1;
                 return true;
             }
+
+            if (this._securityPolicy !== null && this._securityPolicy.length > 0 &&
+                !this._securityPolicy.some(group => group.includes(this._rfbAuthScheme))) {
+                return this._fail("Security type " + this._rfbAuthScheme +
+                                  " is not allowed by the security policy");
+            }
+            this._rfbSecurityType = this._rfbAuthScheme;
         }
 
         this._rfbInitState = 'Authentication';
@@ -2096,12 +2157,32 @@ export default class RFB extends EventTargetMixin {
         return true;
     }
 
+    _dispatchNegotiatedSecurity() {
+        if (this._rfbNegotiatedSecurityDispatched) {
+            return;
+        }
+
+        if (this._rfbNegotiatedSecurity === null) {
+            const details = SECURITY_TYPE_DETAILS[this._rfbSecurityType];
+            this._rfbNegotiatedSecurity = Object.freeze({
+                type: this._rfbSecurityType,
+                ...details,
+            });
+        }
+
+        this._rfbNegotiatedSecurityDispatched = true;
+        this.dispatchEvent(new CustomEvent("negotiatedsecurity", {
+            detail: this._rfbNegotiatedSecurity,
+        }));
+    }
+
     _negotiateAuthentication() {
         switch (this._rfbAuthScheme) {
             case securityTypeNone:
                 if (this._rfbVersion >= 3.8) {
                     this._rfbInitState = 'SecurityResult';
                 } else {
+                    this._dispatchNegotiatedSecurity();
                     this._rfbInitState = 'ClientInitialisation';
                 }
                 return true;
@@ -2150,6 +2231,7 @@ export default class RFB extends EventTargetMixin {
         const status = this._sock.rQshift32();
 
         if (status === 0) { // OK
+            this._dispatchNegotiatedSecurity();
             this._rfbInitState = 'ClientInitialisation';
             Log.Debug('Authentication OK');
             return true;

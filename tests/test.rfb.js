@@ -1406,6 +1406,46 @@ describe('Remote Frame Buffer protocol client', function () {
             cl._sock._websocket._receiveData(new Uint8Array([1, type]));
         }
 
+        function sendServerInit(opts, cl) {
+            const fullOpts = { width: 10, height: 12, bpp: 24, depth: 24, bigEndian: 0,
+                               trueColor: 1, redMax: 255, greenMax: 255, blueMax: 255,
+                               redShift: 16, greenShift: 8, blueShift: 0, name: 'a name' };
+            for (let opt in opts) {
+                fullOpts[opt] = opts[opt];
+            }
+            const data = [];
+
+            push16(data, fullOpts.width);
+            push16(data, fullOpts.height);
+
+            data.push(fullOpts.bpp);
+            data.push(fullOpts.depth);
+            data.push(fullOpts.bigEndian);
+            data.push(fullOpts.trueColor);
+
+            push16(data, fullOpts.redMax);
+            push16(data, fullOpts.greenMax);
+            push16(data, fullOpts.blueMax);
+            push8(data, fullOpts.redShift);
+            push8(data, fullOpts.greenShift);
+            push8(data, fullOpts.blueShift);
+
+            // padding
+            push8(data, 0);
+            push8(data, 0);
+            push8(data, 0);
+
+            cl._sock._websocket._receiveData(new Uint8Array(data));
+
+            const nameData = [];
+            const nameLen = [];
+            pushString(nameData, fullOpts.name);
+            push32(nameLen, nameData.length);
+
+            cl._sock._websocket._receiveData(new Uint8Array(nameLen));
+            cl._sock._websocket._receiveData(new Uint8Array(nameData));
+        }
+
         describe('ProtocolVersion', function () {
             describe('version parsing', function () {
                 it('should interpret version 003.003 as version 3.3', function () {
@@ -1536,10 +1576,70 @@ describe('Remote Frame Buffer protocol client', function () {
                 }
             });
 
-            it('should respect server preference order', function () {
+            it('should respect server preference order when security policy is omitted', function () {
                 const authSchemes = [ 6, 79, 30, 188, 16, 6, 1 ];
                 client._sock._websocket._receiveData(new Uint8Array(authSchemes));
                 expect(client._sock).to.have.sent(new Uint8Array([30]));
+            });
+
+            it('should preserve server preference order when security policy has no groups', function () {
+                const policyClient = makeRFB('wss://host:8675', {
+                    securityPolicy: [],
+                });
+                policyClient._rfbConnectionState = 'connecting';
+                sendVer('003.008\n', policyClient);
+                policyClient._sock._websocket._getSentData();
+
+                policyClient._sock._websocket._receiveData(
+                    new Uint8Array([2, 2, 1]));
+
+                expect(policyClient._sock).to.have.sent(new Uint8Array([2]));
+            });
+
+            it('should apply ordered security policy groups and preserve server order within a group', function () {
+                const policyClient = makeRFB('wss://host:8675', {
+                    securityPolicy: [[5, 129], [6, 2]],
+                });
+                policyClient._rfbConnectionState = 'connecting';
+                sendVer('003.008\n', policyClient);
+                policyClient._sock._websocket._getSentData();
+
+                policyClient._sock._websocket._receiveData(
+                    new Uint8Array([4, 6, 129, 5, 2]));
+
+                expect(policyClient._sock).to.have.sent(new Uint8Array([129]));
+            });
+
+            it('should fail explicitly when no offered type matches a strict security policy', function () {
+                const policyClient = makeRFB('wss://host:8675', {
+                    securityPolicy: [[5, 129]],
+                });
+                policyClient._rfbConnectionState = 'connecting';
+                sinon.spy(policyClient, '_fail');
+                sendVer('003.008\n', policyClient);
+                policyClient._sock._websocket._getSentData();
+
+                policyClient._sock._websocket._receiveData(
+                    new Uint8Array([2, 6, 2]));
+
+                expect(policyClient._fail).to.have.been.calledOnceWithExactly(
+                    'Unsupported security policy (types: 6,2)');
+            });
+
+            it('should fail explicitly when an RFB 3.3 server selects a type outside a strict security policy', function () {
+                const policyClient = makeRFB('wss://host:8675', {
+                    securityPolicy: [[5, 129]],
+                });
+                policyClient._rfbConnectionState = 'connecting';
+                sinon.spy(policyClient, '_fail');
+                sendVer('003.003\n', policyClient);
+                policyClient._sock._websocket._getSentData();
+
+                policyClient._sock._websocket._receiveData(
+                    new Uint8Array([0, 0, 0, 2]));
+
+                expect(policyClient._fail).to.have.been.calledOnceWithExactly(
+                    'Security type 2 is not allowed by the security policy');
             });
 
             it('should fail if there are no supported schemes', function () {
@@ -1602,6 +1702,24 @@ describe('Remote Frame Buffer protocol client', function () {
 
                 client._sock._websocket._receiveData(new Uint8Array([0, 0, 0, 1]));
                 expect(client._rfbInitState).to.equal('ServerInitialisation');
+            });
+
+            it('should accept an RFB 3.3 server type allowed by a strict policy and report it', function () {
+                const policyClient = makeRFB('wss://host:8675', {
+                    securityPolicy: [[1]],
+                });
+                policyClient._rfbConnectionState = 'connecting';
+                const spy = sinon.spy();
+                policyClient.addEventListener('negotiatedsecurity', spy);
+                sendVer('003.003\n', policyClient);
+                policyClient._sock._websocket._getSentData();
+
+                policyClient._sock._websocket._receiveData(
+                    new Uint8Array([0, 0, 0, 1]));
+
+                expect(policyClient._rfbInitState).to.equal('ServerInitialisation');
+                expect(spy).to.have.been.calledOnce;
+                expect(spy.args[0][0].detail.type).to.equal(1);
             });
 
             it('should transition straight to ServerInitialisation on "no auth" for versions < 3.8', function () {
@@ -2433,6 +2551,26 @@ describe('Remote Frame Buffer protocol client', function () {
                     expect(client._rfbRSAAESAuthenticationState).to.equal(null);
                 });
 
+                it('should report Tight UnixLogon as top-level Tight, not RA2_256', function () {
+                    const spy = sinon.spy();
+                    client.addEventListener('negotiatedsecurity', spy);
+                    client.sendCredentials({ username: 'user', password: 'password' });
+                    sendNumStrPairs([[0, 'TGHT', 'NOTUNNEL']], client);
+                    client._sock._websocket._getSentData();
+                    sendNumStrPairs([[129, 'TGHT', 'ULGNAUTH']], client);
+                    clock.tick();
+
+                    client._sock._websocket._receiveData(new Uint8Array([0, 0, 0, 0]));
+
+                    expect(spy).to.have.been.calledOnce;
+                    expect(spy.args[0][0].detail).to.deep.equal({
+                        type: 16,
+                        name: 'Tight',
+                        authenticationEncrypted: false,
+                        sessionEncrypted: false,
+                    });
+                });
+
                 it('should fail if there are no supported auth types', function () {
                     let callback = sinon.spy();
                     client.addEventListener("disconnect", callback);
@@ -2644,6 +2782,62 @@ describe('Remote Frame Buffer protocol client', function () {
                 expect(client._rfbInitState).to.equal('ServerInitialisation');
             });
 
+            it('should emit negotiatedsecurity exactly once after authentication succeeds', function () {
+                const policyClient = makeRFB('wss://host:8675', {
+                    securityPolicy: [[129], [1]],
+                });
+                policyClient._rfbConnectionState = 'connecting';
+                sendVer('003.008\n', policyClient);
+                policyClient._sock._websocket._getSentData();
+                sendSecurity(1, policyClient);
+                policyClient._sock._websocket._getSentData();
+                const events = [];
+                policyClient.addEventListener('negotiatedsecurity', (event) => {
+                    events.push(event.detail);
+                });
+
+                policyClient._sock._websocket._receiveData(
+                    new Uint8Array([0, 0, 0, 0]));
+                policyClient._dispatchNegotiatedSecurity();
+
+                expect(events).to.deep.equal([{
+                    type: 1,
+                    name: 'None',
+                    authenticationEncrypted: false,
+                    sessionEncrypted: false,
+                }]);
+                expect(policyClient._rfbInitState).to.equal('ServerInitialisation');
+            });
+
+            it('should emit negotiatedsecurity before the normal connect event', function () {
+                const events = [];
+                client.addEventListener('negotiatedsecurity', () => events.push('security'));
+                client.addEventListener('connect', () => events.push('connect'));
+                client._sock._websocket._receiveData(new Uint8Array([0, 0, 0, 0]));
+                sendServerInit({}, client);
+
+                expect(events).to.deep.equal(['security', 'connect']);
+            });
+
+            it('should emit the stable RSA-AES authentication result detail', function () {
+                const spy = sinon.spy();
+                const details = Object.freeze({
+                    type: 129,
+                    name: 'RA2_256',
+                    authenticationEncrypted: true,
+                    sessionEncrypted: true,
+                    aesBits: 256,
+                });
+                client._rfbSecurityType = 129;
+                client._rfbNegotiatedSecurity = details;
+                client.addEventListener('negotiatedsecurity', spy);
+
+                client._sock._websocket._receiveData(new Uint8Array([0, 0, 0, 0]));
+
+                expect(spy).to.have.been.calledOnce;
+                expect(spy.args[0][0].detail).to.equal(details);
+            });
+
             it('should include reason when provided in securityfailure event', function () {
                 const spy = sinon.spy();
                 client.addEventListener("securityfailure", spy);
@@ -2696,46 +2890,6 @@ describe('Remote Frame Buffer protocol client', function () {
             beforeEach(function () {
                 client._rfbInitState = 'ServerInitialisation';
             });
-
-            function sendServerInit(opts, client) {
-                const fullOpts = { width: 10, height: 12, bpp: 24, depth: 24, bigEndian: 0,
-                                   trueColor: 1, redMax: 255, greenMax: 255, blueMax: 255,
-                                   redShift: 16, greenShift: 8, blueShift: 0, name: 'a name' };
-                for (let opt in opts) {
-                    fullOpts[opt] = opts[opt];
-                }
-                const data = [];
-
-                push16(data, fullOpts.width);
-                push16(data, fullOpts.height);
-
-                data.push(fullOpts.bpp);
-                data.push(fullOpts.depth);
-                data.push(fullOpts.bigEndian);
-                data.push(fullOpts.trueColor);
-
-                push16(data, fullOpts.redMax);
-                push16(data, fullOpts.greenMax);
-                push16(data, fullOpts.blueMax);
-                push8(data, fullOpts.redShift);
-                push8(data, fullOpts.greenShift);
-                push8(data, fullOpts.blueShift);
-
-                // padding
-                push8(data, 0);
-                push8(data, 0);
-                push8(data, 0);
-
-                client._sock._websocket._receiveData(new Uint8Array(data));
-
-                const nameData = [];
-                let nameLen = [];
-                pushString(nameData, fullOpts.name);
-                push32(nameLen, nameData.length);
-
-                client._sock._websocket._receiveData(new Uint8Array(nameLen));
-                client._sock._websocket._receiveData(new Uint8Array(nameData));
-            }
 
             it('should set the framebuffer width and height', function () {
                 sendServerInit({ width: 32, height: 84 }, client);
