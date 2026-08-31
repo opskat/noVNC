@@ -1,0 +1,37 @@
+name: opskat-vnc-ra2-lab
+
+x-ra2r-common: &ra2r-common
+  image: opskat/vnc-ra2r-oracle:1.0
+  build:
+    context: .
+    dockerfile: oracle.Dockerfile
+  restart: unless-stopped
+  healthcheck:
+    test: ["CMD-SHELL", "nc -z 127.0.0.1 5900"]
+    interval: 10s
+    timeout: 3s
+    retries: 5
+    start_period: 5s
+
+services:
+  ra2r:
+    <<: *ra2r-common
+    container_name: opskat-vnc-ra2r-oracle
+    environment:
+      ORACLE_PASSWORD: ${RA2_LAB_PASSWORD:?set RA2_LAB_PASSWORD}
+      ORACLE_SECURITY_TYPE: 13
+    ports:
+      - "${RA2_LAB_BIND_HOST:-192.168.8.141}:5916:5900"
+    volumes:
+      - ./state/ra2r:/state
+
+  ra2r-256:
+    <<: *ra2r-common
+    container_name: opskat-vnc-ra2r-256-oracle
+    environment:
+      ORACLE_PASSWORD: ${RA2_LAB_PASSWORD:?set RA2_LAB_PASSWORD}
+      ORACLE_SECURITY_TYPE: 133
+    ports:
+      - "${RA2_LAB_BIND_HOST:-192.168.8.141}:5917:5900"
+    volumes:
+      - ./state/ra2r-256:/state
