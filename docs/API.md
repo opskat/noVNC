@@ -104,6 +104,10 @@ protocol stream.
   - The `connect` event is fired when the `RFB` object has completed
     the connection and handshaking with the server.
 
+[`connectionfailure`](#connectionfailure)
+  - The `connectionfailure` event is fired once before an unclean
+    disconnection and identifies the failure using a stable code.
+
 [`credentialsrequired`](#credentialsrequired)
   - The `credentialsrequired` event is fired when more credentials must
     be given to continue.
@@ -276,6 +280,38 @@ property is an `Object` containing the property `types` which is an
 The `connect` event is fired after all the handshaking with the server
 is completed and the connection is fully established. After this event
 the `RFB` object is ready to recieve graphics updates and to send input.
+
+#### connectionfailure
+
+The `connectionfailure` event is fired exactly once before the
+[`disconnect`](#disconnect) event for an unclean connection termination. It is
+not fired for a clean termination initiated by [`RFB.disconnect()`](#rfbdisconnect).
+After this event, the failed connection will not emit a later
+[`negotiatedsecurity`](#negotiatedsecurity) or [`connect`](#connect) event.
+
+The `detail` property is an `Object` containing:
+
+| Property | Type | Description
+| -------- | ---- | -----------
+| `code` | `DOMString` | Stable machine-readable failure code
+| `message` | `DOMString` | Stable human-readable English summary
+| `securityType` | `long` | Optional numeric security type selected or rejected
+| `offeredTypes` | `Array` of `long` | Optional server-offered security types
+
+The following codes and messages are defined:
+
+| Code | Message | Meaning
+| ---- | ------- | -------
+| `policy-rejected` | `The server does not offer a security type allowed by the configured policy.` | A non-empty `securityPolicy` excludes every server-offered type
+| `unsupported-security-type` | `The server does not offer a supported security type.` | No server-offered type is implemented by the client
+| `authentication-failed` | `VNC authentication failed.` | Security negotiation or credential authentication failed
+| `integrity-failed` | `The encrypted VNC connection failed an integrity check.` | An encrypted record was malformed, could not be processed, or failed authentication
+| `transport-closed` | `The VNC connection closed unexpectedly.` | The WebSocket or data channel failed or closed unexpectedly
+
+The existing [`securityfailure`](#securityfailure) event remains available for
+RFB `SecurityResult` status and server-provided reason details. When both events
+apply, `securityfailure` is fired first, followed by `connectionfailure`, then
+an unclean `disconnect`.
 
 #### desktopname
 

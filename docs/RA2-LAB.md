@@ -64,7 +64,9 @@ Expected policy matrix (`S` = `ServerInit`, framebuffer and client flow succeed;
 | prefer_on | S | S | S | S | S | S | S |
 | prefer_off | S | S | S | S | S | S | S |
 
-A passing run reports 35 completed cases. Each successful case asserts that `negotiatedsecurity` precedes `connect` and exactly matches the endpoint's type, stable name, authentication protection, session protection and AES size.
+A passing run reports 35 completed cases. Each successful case asserts that `negotiatedsecurity` precedes `connect`, exactly matches the endpoint's type, stable name, authentication protection, session protection and AES size, and completes a clean user disconnect without `connectionfailure`. Each strict-policy rejection asserts exactly one `connectionfailure` with code `policy-rejected` and the endpoint's offered type, followed by an unclean `disconnect`, with no authentication, `negotiatedsecurity` or `connect` event.
+
+The unit gate additionally covers `unsupported-security-type`, `authentication-failed`, `integrity-failed` and `transport-closed`, including `securityfailure` compatibility, duplicate suppression, stale asynchronous authentication work and fail-closed channel-transform cleanup. Public error messages are stable summaries; protocol and cryptographic implementation details remain confined to logs and are not copied into event data or lab evidence.
 
 ## Wire observation
 

@@ -119,15 +119,27 @@ describe('live RSA-AES interoperability lab', function liveLab() {
                 const { rfb, target, authenticationEvents } = makeClient(endpoint, policy);
                 const events = [];
                 let negotiated = null;
+                let connectionFailure = null;
                 rfb.addEventListener('negotiatedsecurity', (event) => {
                     events.push('negotiatedsecurity');
                     negotiated = event.detail;
                 });
                 rfb.addEventListener('connect', () => events.push('connect'));
+                rfb.addEventListener('connectionfailure', (event) => {
+                    events.push('connectionfailure');
+                    connectionFailure = event.detail;
+                });
+                rfb.addEventListener('disconnect', () => events.push('disconnect'));
 
                 if (!expectedSuccess) {
-                    await waitForEvent(rfb, 'disconnect');
-                    expect(events).to.deep.equal([]);
+                    const disconnected = await waitForEvent(rfb, 'disconnect');
+                    expect(events).to.deep.equal(['connectionfailure', 'disconnect']);
+                    expect(disconnected.detail.clean).to.be.false;
+                    expect(connectionFailure).to.deep.equal({
+                        code: 'policy-rejected',
+                        message: 'The server does not offer a security type allowed by the configured policy.',
+                        offeredTypes: [endpoint.type],
+                    });
                     expect(authenticationEvents, 'authentication must not start').to.deep.equal([]);
                     console.log('RA2_LAB_RESULT ' + JSON.stringify({
                         policy: policy.name,
@@ -135,6 +147,7 @@ describe('live RSA-AES interoperability lab', function liveLab() {
                         port: endpoint.port,
                         expected: 'rejection',
                         observed: 'rejection',
+                        connectionFailure,
                     }));
                     target.remove();
                     return;
@@ -142,6 +155,7 @@ describe('live RSA-AES interoperability lab', function liveLab() {
 
                 await waitForEvent(rfb, 'connect');
                 expect(events).to.deep.equal(['negotiatedsecurity', 'connect']);
+                expect(connectionFailure).to.equal(null);
                 expect(negotiated).to.deep.equal({
                     type: endpoint.type,
                     name: endpoint.name,
@@ -163,6 +177,10 @@ describe('live RSA-AES interoperability lab', function liveLab() {
                     clipboardMarker: flow.clipboardMarker,
                 }));
                 await disconnect(rfb);
+                expect(events).to.deep.equal([
+                    'negotiatedsecurity', 'connect', 'disconnect',
+                ]);
+                expect(connectionFailure).to.equal(null);
                 target.remove();
             });
         }

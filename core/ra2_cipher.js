@@ -4,6 +4,17 @@ export const RA2_RECORD_MAX_PLAINTEXT = 8192;
 const RA2_RECORD_TAG_LENGTH = 16;
 const RA2_RECORD_HEADER_LENGTH = 2;
 
+export class RA2CipherError extends Error {
+    constructor(message, cause = null) {
+        super(message);
+        this.name = 'RA2CipherError';
+        this.failureCode = 'integrity-failed';
+        if (cause !== null) {
+            this.cause = cause;
+        }
+    }
+}
+
 export class RA2RecordCipher {
     constructor() {
         this._cipher = null;
@@ -36,11 +47,16 @@ export class RA2RecordCipher {
         return this._serialize(async () => {
             this._checkGeneration(generation);
             const header = this._makeHeader(message.length);
-            const encrypted = await legacyCrypto.encrypt({
-                name: "AES-EAX",
-                iv: this._counter.slice(),
-                additionalData: header,
-            }, this._cipher, message);
+            let encrypted;
+            try {
+                encrypted = await legacyCrypto.encrypt({
+                    name: "AES-EAX",
+                    iv: this._counter.slice(),
+                    additionalData: header,
+                }, this._cipher, message);
+            } catch (error) {
+                throw new RA2CipherError("RA2 record encryption failed", error);
+            }
             this._checkGeneration(generation);
 
             const record = new Uint8Array(
@@ -59,26 +75,32 @@ export class RA2RecordCipher {
 
         const data = new Uint8Array(record);
         if (data.length < RA2_RECORD_HEADER_LENGTH + RA2_RECORD_TAG_LENGTH) {
-            return Promise.reject(new Error("RA2 record has a malformed length"));
+            return Promise.reject(new RA2CipherError("RA2 record has a malformed length"));
         }
         const length = (data[0] << 8) | data[1];
         if (length > RA2_RECORD_MAX_PLAINTEXT ||
             data.length !== RA2_RECORD_HEADER_LENGTH + length + RA2_RECORD_TAG_LENGTH) {
-            return Promise.reject(new Error("RA2 record has a malformed length"));
+            return Promise.reject(new RA2CipherError("RA2 record has a malformed length"));
         }
 
         const generation = this._generation;
         return this._serialize(async () => {
             this._checkGeneration(generation);
-            const plaintext = await legacyCrypto.decrypt({
-                name: "AES-EAX",
-                iv: this._counter.slice(),
-                additionalData: data.subarray(0, RA2_RECORD_HEADER_LENGTH),
-            }, this._cipher, data.subarray(RA2_RECORD_HEADER_LENGTH));
-            this._checkGeneration(generation);
-            if (plaintext !== null) {
-                this._incrementCounter();
+            let plaintext;
+            try {
+                plaintext = await legacyCrypto.decrypt({
+                    name: "AES-EAX",
+                    iv: this._counter.slice(),
+                    additionalData: data.subarray(0, RA2_RECORD_HEADER_LENGTH),
+                }, this._cipher, data.subarray(RA2_RECORD_HEADER_LENGTH));
+            } catch (error) {
+                throw new RA2CipherError("RA2 record decryption failed", error);
             }
+            this._checkGeneration(generation);
+            if (plaintext === null) {
+                throw new RA2CipherError("RA2 record failed to authenticate");
+            }
+            this._incrementCounter();
             return plaintext;
         });
     }

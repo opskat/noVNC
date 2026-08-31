@@ -737,7 +737,7 @@ describe('Websock', function () {
             await nextTask();
 
             expect(errors).to.have.been.calledOnce;
-            expect(errors.firstCall.args[0].message).to.contain('bad MAC');
+            expect(errors.firstCall.args[0].failureCode).to.equal('integrity-failed');
             expect(messages).not.to.have.been.called;
             expect(websock.readyState).to.equal(WebSocket.CLOSED);
             expect(sock.rQlen()).to.equal(0);
@@ -759,6 +759,7 @@ describe('Websock', function () {
             await nextTask();
 
             expect(errors).to.have.been.calledOnce;
+            expect(errors.firstCall.args[0].failureCode).to.equal('integrity-failed');
             expect(messages).not.to.have.been.called;
             expect(websock.readyState).to.equal(WebSocket.CLOSED);
         });
@@ -775,6 +776,7 @@ describe('Websock', function () {
             await sock.flush();
 
             expect(encryptionErrors).to.have.been.calledOnce;
+            expect(encryptionErrors.firstCall.args[0].failureCode).to.equal('integrity-failed');
             expect(websock.readyState).to.equal(WebSocket.CLOSED);
 
             sock = new Websock();
@@ -793,6 +795,7 @@ describe('Websock', function () {
             await sock.flush();
 
             expect(channelErrors).to.have.been.calledOnce;
+            expect(channelErrors.firstCall.args[0].failureCode).to.equal('transport-closed');
             expect(websock.readyState).to.equal(WebSocket.CLOSED);
         });
 
@@ -809,6 +812,7 @@ describe('Websock', function () {
 
             expect(transform.open).not.to.have.been.called;
             expect(errors).to.have.been.calledOnce;
+            expect(errors.firstCall.args[0].failureCode).to.equal('integrity-failed');
             expect(websock.readyState).to.equal(WebSocket.CLOSED);
         });
 

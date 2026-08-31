@@ -71,6 +71,14 @@ const securityTypeRA2256            = 129;
 const securityTypeRA2ne256          = 130;
 const securityTypeRA2r256           = 133;
 
+const CONNECTION_FAILURE_MESSAGES = Object.freeze({
+    'policy-rejected': 'The server does not offer a security type allowed by the configured policy.',
+    'unsupported-security-type': 'The server does not offer a supported security type.',
+    'authentication-failed': 'VNC authentication failed.',
+    'integrity-failed': 'The encrypted VNC connection failed an integrity check.',
+    'transport-closed': 'The VNC connection closed unexpectedly.',
+});
+
 const SECURITY_TYPE_DETAILS = {
     [securityTypeNone]: {
         name: 'None',
@@ -173,6 +181,7 @@ export default class RFB extends EventTargetMixin {
         this._rfbAuthScheme = -1;
         this._rfbSecurityType = -1;
         this._rfbCleanDisconnect = true;
+        this._rfbConnectionFailureDispatched = false;
         this._rfbRSAAESAuthenticationState = null;
         this._rfbNegotiatedSecurity = null;
         this._rfbNegotiatedSecurityDispatched = false;
@@ -717,24 +726,19 @@ export default class RFB extends EventTargetMixin {
         }
         switch (this._rfbConnectionState) {
             case 'connecting':
-                this._fail("Connection closed " + msg);
-                break;
             case 'connected':
-                // Handle disconnects that were initiated server-side
-                this._updateConnectionState('disconnecting');
-                this._updateConnectionState('disconnected');
+                this._fail("Connection closed " + msg, 'transport-closed');
                 break;
             case 'disconnecting':
                 // Normal disconnection path
                 this._updateConnectionState('disconnected');
                 break;
             case 'disconnected':
-                this._fail("Unexpected server disconnect " +
-                           "when already disconnected " + msg);
+                Log.Debug("Ignoring server disconnect after disconnection " + msg);
                 break;
             default:
                 this._fail("Unexpected server disconnect before connecting " +
-                           msg);
+                           msg, 'transport-closed');
                 break;
         }
         this._sock.off('close');
@@ -742,8 +746,21 @@ export default class RFB extends EventTargetMixin {
         this._rawChannel = null;
     }
 
-    _socketError(e) {
+    _socketError(error) {
         Log.Warn("WebSocket on-error event");
+        if (this._rfbConnectionState !== 'connecting' &&
+            this._rfbConnectionState !== 'connected') {
+            return;
+        }
+
+        const failureCode = error !== null &&
+            CONNECTION_FAILURE_MESSAGES[error.failureCode] !== undefined ?
+            error.failureCode : 'transport-closed';
+        const context = {};
+        if (this._rfbSecurityType >= 0) {
+            context.securityType = this._rfbSecurityType;
+        }
+        this._fail("WebSocket error", failureCode, context);
     }
 
     _focusCanvas(event) {
@@ -1008,11 +1025,14 @@ export default class RFB extends EventTargetMixin {
      * The parameter 'details' is used for information that
      * should be logged but not sent to the user interface.
      */
-    _fail(details) {
+    _fail(details, failureCode = 'transport-closed', context = {}) {
         switch (this._rfbConnectionState) {
             case 'disconnecting':
                 Log.Error("Failed when disconnecting: " + details);
-                break;
+                return false;
+            case 'disconnected':
+                Log.Error("Failed after disconnecting: " + details);
+                return false;
             case 'connected':
                 Log.Error("Failed while connected: " + details);
                 break;
@@ -1025,9 +1045,28 @@ export default class RFB extends EventTargetMixin {
         }
         this._rfbCleanDisconnect = false; //This is sent to the UI
 
+        if (!this._rfbConnectionFailureDispatched) {
+            const detail = {
+                code: failureCode,
+                message: CONNECTION_FAILURE_MESSAGES[failureCode],
+            };
+            if (context.securityType !== undefined) {
+                detail.securityType = context.securityType;
+            }
+            if (context.offeredTypes !== undefined) {
+                detail.offeredTypes = Array.from(context.offeredTypes);
+            }
+            this._rfbConnectionFailureDispatched = true;
+            this.dispatchEvent(new CustomEvent("connectionfailure", {
+                detail: Object.freeze(detail),
+            }));
+        }
+
         // Transition to disconnected without waiting for socket to close
         this._updateConnectionState('disconnecting');
-        this._updateConnectionState('disconnected');
+        if (this._rfbConnectionState === 'disconnecting') {
+            this._updateConnectionState('disconnected');
+        }
 
         return false;
     }
@@ -1659,9 +1698,13 @@ export default class RFB extends EventTargetMixin {
 
             if (this._rfbAuthScheme === -1) {
                 if (this._securityPolicy !== null && this._securityPolicy.length > 0) {
-                    return this._fail("Unsupported security policy (types: " + types + ")");
+                    return this._fail(
+                        "Unsupported security policy (types: " + types + ")",
+                        'policy-rejected', { offeredTypes: types });
                 }
-                return this._fail("Unsupported security types (types: " + types + ")");
+                return this._fail(
+                    "Unsupported security types (types: " + types + ")",
+                    'unsupported-security-type', { offeredTypes: types });
             }
 
             this._rfbSecurityType = this._rfbAuthScheme;
@@ -1681,8 +1724,13 @@ export default class RFB extends EventTargetMixin {
 
             if (this._securityPolicy !== null && this._securityPolicy.length > 0 &&
                 !this._securityPolicy.some(group => group.includes(this._rfbAuthScheme))) {
-                return this._fail("Security type " + this._rfbAuthScheme +
-                                  " is not allowed by the security policy");
+                return this._fail(
+                    "Security type " + this._rfbAuthScheme +
+                    " is not allowed by the security policy",
+                    'policy-rejected', {
+                        securityType: this._rfbAuthScheme,
+                        offeredTypes: [this._rfbAuthScheme],
+                    });
             }
             this._rfbSecurityType = this._rfbAuthScheme;
         }
@@ -1691,6 +1739,13 @@ export default class RFB extends EventTargetMixin {
         Log.Debug('Authenticating using scheme: ' + this._rfbAuthScheme);
 
         return true;
+    }
+
+    _securityFailureContext() {
+        if (this._rfbSecurityType >= 0) {
+            return { securityType: this._rfbSecurityType };
+        }
+        return {};
     }
 
     _handleSecurityReason() {
@@ -1711,16 +1766,18 @@ export default class RFB extends EventTargetMixin {
                 { detail: { status: this._securityStatus,
                             reason: reason } }));
 
-            return this._fail("Security negotiation failed on " +
-                              this._securityContext +
-                              " (reason: " + reason + ")");
+            return this._fail(
+                "Security negotiation failed on " + this._securityContext +
+                " (reason: " + reason + ")",
+                'authentication-failed', this._securityFailureContext());
         } else {
             this.dispatchEvent(new CustomEvent(
                 "securityfailure",
                 { detail: { status: this._securityStatus } }));
 
-            return this._fail("Security negotiation failed on " +
-                              this._securityContext);
+            return this._fail(
+                "Security negotiation failed on " + this._securityContext,
+                'authentication-failed', this._securityFailureContext());
         }
     }
 
@@ -1819,7 +1876,9 @@ export default class RFB extends EventTargetMixin {
             }
 
             if (this._rfbAuthScheme === -1) {
-                return this._fail("Unsupported security types (types: " + subtypes + ")");
+                return this._fail(
+                    "Unsupported security types (types: " + subtypes + ")",
+                    'unsupported-security-type', { offeredTypes: subtypes });
             }
 
             this._sock.sQpush32(this._rfbAuthScheme);
@@ -2096,10 +2155,16 @@ export default class RFB extends EventTargetMixin {
                         this._resumeAuthentication();
                     }
                 })
-                .catch((e) => {
-                    if (e.message !== "disconnect normally") {
-                        this._fail(e.message);
+                .catch((error) => {
+                    if (this._rfbConnectionState !== 'connecting') {
+                        return;
                     }
+                    const failureCode = error !== null &&
+                        error.failureCode === 'integrity-failed' ?
+                        'integrity-failed' : 'authentication-failed';
+                    this._fail(error.message, failureCode, {
+                        securityType: this._rfbSecurityType,
+                    });
                 })
                 .finally(() => {
                     state.removeEventListener(
@@ -2158,7 +2223,9 @@ export default class RFB extends EventTargetMixin {
     }
 
     _dispatchNegotiatedSecurity() {
-        if (this._rfbNegotiatedSecurityDispatched) {
+        if (this._rfbNegotiatedSecurityDispatched ||
+            this._rfbConnectionState !== 'connecting' ||
+            this._rfbConnectionFailureDispatched) {
             return;
         }
 
@@ -2220,8 +2287,11 @@ export default class RFB extends EventTargetMixin {
                 return this._negotiateMSLogonIIAuth();
 
             default:
-                return this._fail("Unsupported auth scheme (scheme: " +
-                                  this._rfbAuthScheme + ")");
+                return this._fail(
+                    "Unsupported auth scheme (scheme: " + this._rfbAuthScheme + ")",
+                    'unsupported-security-type', {
+                        securityType: this._rfbAuthScheme,
+                    });
         }
     }
 
@@ -2246,7 +2316,9 @@ export default class RFB extends EventTargetMixin {
                     "securityfailure",
                     { detail: { status: status } }));
 
-                return this._fail("Security handshake failed");
+                return this._fail(
+                    "Security handshake failed", 'authentication-failed',
+                    this._securityFailureContext());
             }
         }
     }
@@ -2431,7 +2503,12 @@ export default class RFB extends EventTargetMixin {
     _resumeAuthentication() {
         // We use setTimeout() so it's run in its own context, just like
         // it originally did via the WebSocket's event handler
-        setTimeout(this._initMsg.bind(this), 0);
+        setTimeout(() => {
+            if (this._rfbConnectionState === 'connecting' &&
+                !this._rfbConnectionFailureDispatched) {
+                this._initMsg();
+            }
+        }, 0);
     }
 
     _handleSetColourMapMsg() {

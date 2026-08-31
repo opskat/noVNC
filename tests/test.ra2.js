@@ -1,5 +1,5 @@
 import RSAAESAuthenticationState from '../core/ra2.js';
-import RA2RecordCipher from '../core/ra2_cipher.js';
+import RA2RecordCipher, { RA2CipherError } from '../core/ra2_cipher.js';
 import legacyCrypto from '../core/crypto/crypto.js';
 
 function fromHex(value) {
@@ -379,18 +379,26 @@ describe('RA2RecordCipher', function () {
         changedLength[1] = 4;
 
         await expectRejected(receiver.open(record.slice(0, -1)), 'length');
-        expect(await receiver.open(changedLength)).to.equal(null);
+        await expectRejected(receiver.open(changedLength), 'authenticate');
     });
 
-    it('should not advance the counter after failed authentication', async function () {
+    it('should reject failed authentication with a typed integrity error without advancing the counter', async function () {
         const key = new Uint8Array(16).map((_, i) => i);
         const sender = await makeCipher(key);
         const receiver = await makeCipher(key);
         const record = await sender.seal(new Uint8Array([1, 2, 3]));
         const tampered = record.slice();
         tampered[tampered.length - 1] ^= 1;
+        let failure;
 
-        expect(await receiver.open(tampered)).to.equal(null);
+        try {
+            await receiver.open(tampered);
+        } catch (error) {
+            failure = error;
+        }
+
+        expect(failure).to.be.instanceOf(RA2CipherError);
+        expect(failure.failureCode).to.equal('integrity-failed');
         expect(await receiver.open(record)).to.array.equal(new Uint8Array([1, 2, 3]));
     });
 

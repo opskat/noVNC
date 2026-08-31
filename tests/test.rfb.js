@@ -1382,6 +1382,160 @@ describe('Remote Frame Buffer protocol client', function () {
                 expect(spy.args[0][0].detail.clean).to.be.false;
             });
 
+            it('should emit connectionfailure once before an unclean disconnect', function () {
+                client._rfbConnectionState = 'connected';
+                const events = [];
+                let failure;
+                client.addEventListener('connectionfailure', (event) => {
+                    events.push('connectionfailure');
+                    failure = event.detail;
+                });
+                client.addEventListener('disconnect', () => events.push('disconnect'));
+
+                client._fail('unexpected failure');
+                client._fail('duplicate failure');
+
+                expect(events).to.deep.equal(['connectionfailure', 'disconnect']);
+                expect(failure).to.deep.equal({
+                    code: 'transport-closed',
+                    message: 'The VNC connection closed unexpectedly.',
+                });
+            });
+
+            it('should preserve a producer-owned typed failure detail', function () {
+                client._rfbConnectionState = 'connecting';
+                const spy = sinon.spy();
+                client.addEventListener('connectionfailure', spy);
+
+                client._fail('policy details for the log', 'policy-rejected', {
+                    securityType: 2,
+                    offeredTypes: [2],
+                });
+
+                expect(spy).to.have.been.calledOnce;
+                expect(spy.firstCall.args[0].detail).to.deep.equal({
+                    code: 'policy-rejected',
+                    message: 'The server does not offer a security type allowed by the configured policy.',
+                    securityType: 2,
+                    offeredTypes: [2],
+                });
+            });
+
+            it('should not emit connectionfailure for a user disconnect', function () {
+                const failure = sinon.spy();
+                const disconnected = sinon.spy();
+                client.addEventListener('connectionfailure', failure);
+                client.addEventListener('disconnect', disconnected);
+
+                client.disconnect();
+                client._socketError(new Error('late channel error'));
+                this.clock.tick(4000);
+
+                expect(failure).not.to.have.been.called;
+                expect(disconnected).to.have.been.calledOnce;
+                expect(disconnected.firstCall.args[0].detail.clean).to.be.true;
+            });
+
+            it('should classify a remote transport close before disconnect', function () {
+                client._rfbConnectionState = 'connected';
+                const events = [];
+                let failure;
+                client.addEventListener('connectionfailure', (event) => {
+                    events.push('connectionfailure');
+                    failure = event.detail;
+                });
+                client.addEventListener('disconnect', (event) => {
+                    events.push('disconnect');
+                    expect(event.detail.clean).to.be.false;
+                });
+
+                client._socketClose({ code: 1006, reason: '' });
+
+                expect(events).to.deep.equal(['connectionfailure', 'disconnect']);
+                expect(failure).to.deep.equal({
+                    code: 'transport-closed',
+                    message: 'The VNC connection closed unexpectedly.',
+                });
+            });
+
+            it('should classify a producer-owned integrity error', function () {
+                const spy = sinon.spy();
+                client.addEventListener('connectionfailure', spy);
+                const error = new Error('implementation-specific cipher text');
+                error.failureCode = 'integrity-failed';
+
+                client._socketError(error);
+
+                expect(spy).to.have.been.calledOnce;
+                expect(spy.firstCall.args[0].detail).to.deep.equal({
+                    code: 'integrity-failed',
+                    message: 'The encrypted VNC connection failed an integrity check.',
+                });
+            });
+
+            it('should classify RSA-AES asynchronous failures without parsing messages', async function () {
+                let rejectAuthentication;
+                const state = {
+                    hasStarted: false,
+                    securityDetails: {},
+                    addEventListener: sinon.spy(),
+                    removeEventListener: sinon.spy(),
+                    checkInternalEvents: sinon.spy(),
+                    negotiateAuthAsync: () => new Promise((resolve, reject) => {
+                        rejectAuthentication = reject;
+                    }),
+                };
+                client._rfbConnectionState = 'connecting';
+                client._rfbAuthScheme = 129;
+                client._rfbSecurityType = 129;
+                client._rfbRSAAESAuthenticationState = state;
+                const failure = new Promise((resolve) => {
+                    client.addEventListener('connectionfailure', resolve, { once: true });
+                });
+
+                client._negotiateRSAAESAuth();
+                const error = new Error('localized or implementation-specific text');
+                error.failureCode = 'integrity-failed';
+                rejectAuthentication(error);
+
+                expect((await failure).detail).to.deep.equal({
+                    code: 'integrity-failed',
+                    message: 'The encrypted VNC connection failed an integrity check.',
+                    securityType: 129,
+                });
+            });
+
+            it('should ignore stale RSA-AES failures after a user disconnect', async function () {
+                let rejectAuthentication;
+                const state = {
+                    hasStarted: false,
+                    securityDetails: {},
+                    addEventListener: sinon.spy(),
+                    removeEventListener: sinon.spy(),
+                    checkInternalEvents: sinon.spy(),
+                    disconnect: sinon.spy(),
+                    negotiateAuthAsync: () => new Promise((resolve, reject) => {
+                        rejectAuthentication = reject;
+                    }),
+                };
+                client._rfbConnectionState = 'connecting';
+                client._rfbAuthScheme = 129;
+                client._rfbSecurityType = 129;
+                client._rfbRSAAESAuthenticationState = state;
+                const failure = sinon.spy();
+                client.addEventListener('connectionfailure', failure);
+
+                client._negotiateRSAAESAuth();
+                client.disconnect();
+                rejectAuthentication(new Error('arbitrary stale failure'));
+                await Promise.resolve();
+                await Promise.resolve();
+                this.clock.tick(4000);
+
+                expect(failure).not.to.have.been.called;
+                expect(client._rfbCleanDisconnect).to.be.true;
+            });
+
         });
     });
 
@@ -1615,15 +1769,27 @@ describe('Remote Frame Buffer protocol client', function () {
                     securityPolicy: [[5, 129]],
                 });
                 policyClient._rfbConnectionState = 'connecting';
-                sinon.spy(policyClient, '_fail');
+                const events = [];
+                let failure;
+                policyClient.addEventListener('connectionfailure', (event) => {
+                    events.push('connectionfailure');
+                    failure = event.detail;
+                });
+                policyClient.addEventListener('disconnect', () => events.push('disconnect'));
+                policyClient.addEventListener('negotiatedsecurity', () => events.push('negotiatedsecurity'));
+                policyClient.addEventListener('connect', () => events.push('connect'));
                 sendVer('003.008\n', policyClient);
                 policyClient._sock._websocket._getSentData();
 
                 policyClient._sock._websocket._receiveData(
                     new Uint8Array([2, 6, 2]));
 
-                expect(policyClient._fail).to.have.been.calledOnceWithExactly(
-                    'Unsupported security policy (types: 6,2)');
+                expect(events).to.deep.equal(['connectionfailure', 'disconnect']);
+                expect(failure).to.deep.equal({
+                    code: 'policy-rejected',
+                    message: 'The server does not offer a security type allowed by the configured policy.',
+                    offeredTypes: [6, 2],
+                });
             });
 
             it('should fail explicitly when an RFB 3.3 server selects a type outside a strict security policy', function () {
@@ -1631,24 +1797,38 @@ describe('Remote Frame Buffer protocol client', function () {
                     securityPolicy: [[5, 129]],
                 });
                 policyClient._rfbConnectionState = 'connecting';
-                sinon.spy(policyClient, '_fail');
+                const spy = sinon.spy();
+                policyClient.addEventListener('connectionfailure', spy);
                 sendVer('003.003\n', policyClient);
                 policyClient._sock._websocket._getSentData();
 
                 policyClient._sock._websocket._receiveData(
                     new Uint8Array([0, 0, 0, 2]));
 
-                expect(policyClient._fail).to.have.been.calledOnceWithExactly(
-                    'Security type 2 is not allowed by the security policy');
+                expect(spy).to.have.been.calledOnce;
+                expect(spy.firstCall.args[0].detail).to.deep.equal({
+                    code: 'policy-rejected',
+                    message: 'The server does not offer a security type allowed by the configured policy.',
+                    securityType: 2,
+                    offeredTypes: [2],
+                });
             });
 
             it('should fail if there are no supported schemes', function () {
+                const failure = sinon.spy();
                 let callback = sinon.spy();
+                client.addEventListener('connectionfailure', failure);
                 client.addEventListener("disconnect", callback);
 
                 const authSchemes = [1, 32];
                 client._sock._websocket._receiveData(new Uint8Array(authSchemes));
 
+                expect(failure).to.have.been.calledOnce;
+                expect(failure.firstCall.args[0].detail).to.deep.equal({
+                    code: 'unsupported-security-type',
+                    message: 'The server does not offer a supported security type.',
+                    offeredTypes: [32],
+                });
                 expect(callback).to.have.been.calledOnce;
                 expect(callback.args[0][0].detail.clean).to.be.false;
             });
@@ -2838,15 +3018,35 @@ describe('Remote Frame Buffer protocol client', function () {
                 expect(spy.args[0][0].detail).to.equal(details);
             });
 
-            it('should include reason when provided in securityfailure event', function () {
-                const spy = sinon.spy();
-                client.addEventListener("securityfailure", spy);
+            it('should preserve securityfailure before a typed authentication failure', function () {
+                const events = [];
+                let securityFailure;
+                let connectionFailure;
+                client.addEventListener('securityfailure', (event) => {
+                    events.push('securityfailure');
+                    securityFailure = event.detail;
+                });
+                client.addEventListener('connectionfailure', (event) => {
+                    events.push('connectionfailure');
+                    connectionFailure = event.detail;
+                });
+                client.addEventListener('disconnect', () => events.push('disconnect'));
+                client.addEventListener('negotiatedsecurity', () => events.push('negotiatedsecurity'));
+                client.addEventListener('connect', () => events.push('connect'));
                 const failureData = [0, 0, 0, 1, 0, 0, 0, 12, 115, 117, 99, 104,
                                      32, 102, 97, 105, 108, 117, 114, 101];
+
                 client._sock._websocket._receiveData(new Uint8Array(failureData));
-                expect(spy).to.have.been.calledOnce;
-                expect(spy.args[0][0].detail.status).to.equal(1);
-                expect(spy.args[0][0].detail.reason).to.equal('such failure');
+
+                expect(events).to.deep.equal([
+                    'securityfailure', 'connectionfailure', 'disconnect',
+                ]);
+                expect(securityFailure).to.deep.equal({ status: 1, reason: 'such failure' });
+                expect(connectionFailure).to.deep.equal({
+                    code: 'authentication-failed',
+                    message: 'VNC authentication failed.',
+                    securityType: 1,
+                });
             });
 
             it('should not include reason when length is zero in securityfailure event', function () {

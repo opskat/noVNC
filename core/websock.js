@@ -38,6 +38,17 @@ const ReadyStates = {
     CLOSED: [WebSocket.CLOSED, DataChannel.CLOSED],
 };
 
+export class WebsockError extends Error {
+    constructor(failureCode, message, cause = null) {
+        super(message);
+        this.name = 'WebsockError';
+        this.failureCode = failureCode;
+        if (cause !== null) {
+            this.cause = cause;
+        }
+    }
+}
+
 // Properties a raw channel must have, WebSocket and RTCDataChannel are two examples
 const rawChannelProps = [
     "send",
@@ -239,7 +250,12 @@ export default class Websock {
         const data = this._sQ.slice(0, this._sQlen);
         this._sQlen = 0;
         if (this._sendTransform === null) {
-            this._websocket.send(data);
+            try {
+                this._websocket.send(data);
+            } catch (error) {
+                this._failTransportTransform(new WebsockError(
+                    'transport-closed', 'The transport channel failed to send data.', error));
+            }
             return Promise.resolve();
         }
 
@@ -249,13 +265,24 @@ export default class Websock {
             for (let offset = 0; offset < data.length; offset += MAX_TRANSFORM_PLAINTEXT) {
                 const plaintext = data.subarray(
                     offset, Math.min(offset + MAX_TRANSFORM_PLAINTEXT, data.length));
-                const record = await transform.seal(plaintext);
+                let record;
+                try {
+                    record = await transform.seal(plaintext);
+                } catch (error) {
+                    throw new WebsockError(
+                        'integrity-failed', 'The encrypted transport failed to seal a record.', error);
+                }
                 if (generation !== this._transformGeneration ||
                     transform !== this._sendTransform || this.readyState !== 'open') {
                     transform.reset();
                     return;
                 }
-                this._websocket.send(record);
+                try {
+                    this._websocket.send(record);
+                } catch (error) {
+                    throw new WebsockError(
+                        'transport-closed', 'The transport channel failed to send data.', error);
+                }
             }
         });
         this._sendTransformChain = operation.catch((error) => {
@@ -379,7 +406,8 @@ export default class Websock {
 
         this._websocket.onerror = (e) => {
             Log.Debug(">> WebSock.onerror: " + e);
-            this._eventHandlers.error(e);
+            this._eventHandlers.error(new WebsockError(
+                'transport-closed', 'The transport channel reported an error.', e));
             Log.Debug("<< WebSock.onerror: " + e);
         };
     }
@@ -490,7 +518,8 @@ export default class Websock {
                 }
                 const length = (this._transformRQ[0] << 8) | this._transformRQ[1];
                 if (length > MAX_TRANSFORM_PLAINTEXT) {
-                    throw new Error("Encrypted transport record has a malformed length");
+                    throw new WebsockError(
+                        'integrity-failed', 'The encrypted transport record has a malformed length.');
                 }
                 const recordLength = TRANSFORM_HEADER_LENGTH + length +
                                      TRANSFORM_TAG_LENGTH;
@@ -500,14 +529,21 @@ export default class Websock {
 
                 const record = this._transformRQ.slice(0, recordLength);
                 this._transformRQ = this._transformRQ.slice(recordLength);
-                const plaintext = await transform.open(record);
+                let plaintext;
+                try {
+                    plaintext = await transform.open(record);
+                } catch (error) {
+                    throw new WebsockError(
+                        'integrity-failed', 'The encrypted transport failed to open a record.', error);
+                }
                 if (generation !== this._transformGeneration ||
                     transform !== this._receiveTransform) {
                     transform.reset();
                     return;
                 }
                 if (plaintext === null) {
-                    throw new Error("Encrypted transport record failed authentication");
+                    throw new WebsockError(
+                        'integrity-failed', 'The encrypted transport record failed authentication.');
                 }
                 this._appendReceiveData(plaintext);
             }
