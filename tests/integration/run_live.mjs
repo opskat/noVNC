@@ -40,11 +40,17 @@ const endpoints = [
 const proxies = [];
 try {
     for (const [index, endpoint] of endpoints.entries()) {
-        proxies.push(await listenWebSocketProxy({
+        const proxy = await listenWebSocketProxy({
             listenPort: proxyBasePort + index,
             targetHost: endpointHost,
             targetPort: endpoint.port,
-        }));
+        });
+        proxies.push(proxy);
+        const address = proxy.address();
+        if (address === null || typeof address === 'string' ||
+            address.address !== '127.0.0.1') {
+            throw new Error(`WebSocket proxy must bind to loopback, received ${JSON.stringify(address)}`);
+        }
     }
 
     const child = spawn(process.execPath, [

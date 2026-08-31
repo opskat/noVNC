@@ -4,7 +4,7 @@ const net = require('node:net');
 const { WebSocketServer } = require('ws');
 
 function listenWebSocketProxy({ listenPort, targetHost, targetPort }) {
-    const server = new WebSocketServer({ port: listenPort });
+    const server = new WebSocketServer({ host: '127.0.0.1', port: listenPort });
 
     server.on('connection', (websocket) => {
         const socket = net.createConnection({ host: targetHost, port: targetPort });
