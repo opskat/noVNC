@@ -344,6 +344,23 @@ describe('RSA-AES authentication variants', function () {
         await expectRejected(result.negotiation, 'authenticate');
         expect(result.sock.activations).to.have.length(0);
     });
+
+    it('classifies malformed encrypted handshake lengths as integrity failures', async function () {
+        const sock = new FakeRA2Socket();
+        const state = new RSAAESAuthenticationState(
+            sock, () => ({ password: 'pass' }), 5);
+        sock.receive(new Uint8Array([0, 2]));
+        let failure;
+
+        try {
+            await state._openRecord({}, 1, 'subtype');
+        } catch (error) {
+            failure = error;
+        }
+
+        expect(failure).to.be.instanceOf(RA2CipherError);
+        expect(failure.failureCode).to.equal('integrity-failed');
+    });
 });
 
 describe('RA2RecordCipher', function () {

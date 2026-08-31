@@ -1,7 +1,7 @@
 import { encodeUTF8 } from './util/strings.js';
 import EventTargetMixin from './util/eventtarget.js';
 import legacyCrypto from './crypto/crypto.js';
-import RA2RecordCipher from './ra2_cipher.js';
+import RA2RecordCipher, { RA2CipherError } from './ra2_cipher.js';
 
 const RA2_VARIANTS = {
     5: {
@@ -170,7 +170,7 @@ export default class RSAAESAuthenticationState extends EventTargetMixin {
         const header = this._sock.rQpeekBytes(2);
         const length = (header[0] << 8) | header[1];
         if (length !== expectedLength) {
-            throw new Error("RA2: wrong " + description);
+            throw new RA2CipherError("RA2: wrong " + description);
         }
         await this._waitSockAsync(2 + length + 16);
         const plaintext = await cipher.open(
