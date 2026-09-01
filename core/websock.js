@@ -18,6 +18,9 @@ import * as Log from './util/logging.js';
 // doesn't gain a tremendous amount of performance increase in Firefox
 // at the moment.  It may be valuable to turn it on in the future.
 const MAX_RQ_GROW_SIZE = 40 * 1024 * 1024;  // 40 MiB
+const MAX_TRANSFORM_PLAINTEXT = 8192;
+const TRANSFORM_HEADER_LENGTH = 2;
+const TRANSFORM_TAG_LENGTH = 16;
 
 // Constants pulled from RTCDataChannelState enum
 // https://developer.mozilla.org/en-US/docs/Web/API/RTCDataChannel/readyState#RTCDataChannelState_enum
@@ -34,6 +37,17 @@ const ReadyStates = {
     CLOSING: [WebSocket.CLOSING, DataChannel.CLOSING],
     CLOSED: [WebSocket.CLOSED, DataChannel.CLOSED],
 };
+
+export class WebsockError extends Error {
+    constructor(failureCode, message, cause = null) {
+        super(message);
+        this.name = 'WebsockError';
+        this.failureCode = failureCode;
+        if (cause !== null) {
+            this.cause = cause;
+        }
+    }
+}
 
 // Properties a raw channel must have, WebSocket and RTCDataChannel are two examples
 const rawChannelProps = [
@@ -61,6 +75,13 @@ export default class Websock {
         // called in init: this._sQ = new Uint8Array(this._sQbufferSize);
         this._sQlen = 0;
         this._sQ = null;  // Send queue
+
+        this._sendTransform = null;
+        this._receiveTransform = null;
+        this._transformGeneration = 0;
+        this._transformRQ = new Uint8Array(0);
+        this._sendTransformChain = Promise.resolve();
+        this._receiveTransformTask = null;
 
         this._eventHandlers = {
             message: () => {},
@@ -219,9 +240,101 @@ export default class Websock {
     }
 
     flush() {
-        if (this._sQlen > 0 && this.readyState === 'open') {
-            this._websocket.send(new Uint8Array(this._sQ.buffer, 0, this._sQlen));
-            this._sQlen = 0;
+        if (this._sQlen === 0) {
+            return this._sendTransformChain;
+        }
+        if (this.readyState !== 'open') {
+            return Promise.resolve();
+        }
+
+        const data = this._sQ.slice(0, this._sQlen);
+        this._sQlen = 0;
+        if (this._sendTransform === null) {
+            try {
+                this._websocket.send(data);
+            } catch (error) {
+                this._failTransportTransform(new WebsockError(
+                    'transport-closed', 'The transport channel failed to send data.', error));
+            }
+            return Promise.resolve();
+        }
+
+        const transform = this._sendTransform;
+        const generation = this._transformGeneration;
+        const operation = this._sendTransformChain.then(async () => {
+            for (let offset = 0; offset < data.length; offset += MAX_TRANSFORM_PLAINTEXT) {
+                const plaintext = data.subarray(
+                    offset, Math.min(offset + MAX_TRANSFORM_PLAINTEXT, data.length));
+                let record;
+                try {
+                    record = await transform.seal(plaintext);
+                } catch (error) {
+                    throw new WebsockError(
+                        'integrity-failed', 'The encrypted transport failed to seal a record.', error);
+                }
+                if (generation !== this._transformGeneration ||
+                    transform !== this._sendTransform || this.readyState !== 'open') {
+                    transform.reset();
+                    return;
+                }
+                try {
+                    this._websocket.send(record);
+                } catch (error) {
+                    throw new WebsockError(
+                        'transport-closed', 'The transport channel failed to send data.', error);
+                }
+            }
+        });
+        this._sendTransformChain = operation.catch((error) => {
+            if (generation === this._transformGeneration &&
+                transform === this._sendTransform) {
+                this._failTransportTransform(error);
+            }
+        });
+        return this._sendTransformChain;
+    }
+
+    activateTransportTransform(sendTransform, receiveTransform) {
+        if (sendTransform !== null &&
+            (typeof sendTransform.seal !== 'function' ||
+             typeof sendTransform.reset !== 'function')) {
+            throw new Error("Send transport transform is missing seal() or reset()");
+        }
+        if (receiveTransform !== null &&
+            (typeof receiveTransform.open !== 'function' ||
+             typeof receiveTransform.reset !== 'function')) {
+            throw new Error("Receive transport transform is missing open() or reset()");
+        }
+
+        this.deactivateTransportTransform();
+        this._sendTransform = sendTransform;
+        this._receiveTransform = receiveTransform;
+
+        if (receiveTransform !== null && this.rQlen() > 0) {
+            this._transformRQ = this.rQshiftBytes(this.rQlen());
+            this._rQi = 0;
+            this._rQlen = 0;
+            return this._processTransformReceive();
+        }
+        return Promise.resolve();
+    }
+
+    deactivateTransportTransform() {
+        this._transformGeneration++;
+        const sendTransform = this._sendTransform;
+        const receiveTransform = this._receiveTransform;
+        this._sendTransform = null;
+        this._receiveTransform = null;
+        this._transformRQ = new Uint8Array(0);
+        this._receiveTransformTask = null;
+        this._sendTransformChain = Promise.resolve();
+
+        if (sendTransform !== null && typeof sendTransform.reset === 'function') {
+            sendTransform.reset();
+        }
+        if (receiveTransform !== null && receiveTransform !== sendTransform &&
+            typeof receiveTransform.reset === 'function') {
+            receiveTransform.reset();
         }
     }
 
@@ -246,8 +359,11 @@ export default class Websock {
     }
 
     init() {
+        this.deactivateTransportTransform();
         this._allocateBuffers();
         this._rQi = 0;
+        this._rQlen = 0;
+        this._sQlen = 0;
         this._websocket = null;
     }
 
@@ -283,18 +399,21 @@ export default class Websock {
 
         this._websocket.onclose = (e) => {
             Log.Debug(">> WebSock.onclose");
+            this.deactivateTransportTransform();
             this._eventHandlers.close(e);
             Log.Debug("<< WebSock.onclose");
         };
 
         this._websocket.onerror = (e) => {
             Log.Debug(">> WebSock.onerror: " + e);
-            this._eventHandlers.error(e);
+            this._eventHandlers.error(new WebsockError(
+                'transport-closed', 'The transport channel reported an error.', e));
             Log.Debug("<< WebSock.onerror: " + e);
         };
     }
 
     close() {
+        this.deactivateTransportTransform();
         if (this._websocket) {
             if (this.readyState === 'connecting' ||
                 this.readyState === 'open') {
@@ -347,23 +466,112 @@ export default class Websock {
 
     // push arraybuffer values onto the end of the receive que
     _recvMessage(e) {
+        const u8 = new Uint8Array(e.data);
+        if (this._receiveTransform !== null) {
+            if (u8.length === 0) {
+                Log.Debug("Ignoring empty message");
+                return;
+            }
+            const encrypted = new Uint8Array(this._transformRQ.length + u8.length);
+            encrypted.set(this._transformRQ);
+            encrypted.set(u8, this._transformRQ.length);
+            this._transformRQ = encrypted;
+            this._processTransformReceive();
+            return;
+        }
+
+        this._appendReceiveData(u8);
+    }
+
+    _appendReceiveData(data) {
         if (this._rQlen == this._rQi) {
             // All data has now been processed, this means we
             // can reset the receive queue.
             this._rQlen = 0;
             this._rQi = 0;
         }
-        const u8 = new Uint8Array(e.data);
-        if (u8.length > this._rQbufferSize - this._rQlen) {
-            this._expandCompactRQ(u8.length);
+        if (data.length > this._rQbufferSize - this._rQlen) {
+            this._expandCompactRQ(data.length);
         }
-        this._rQ.set(u8, this._rQlen);
-        this._rQlen += u8.length;
+        this._rQ.set(data, this._rQlen);
+        this._rQlen += data.length;
 
-        if (this._rQlen - this._rQi > 0) {
+        if (data.length > 0) {
             this._eventHandlers.message();
         } else {
             Log.Debug("Ignoring empty message");
+        }
+    }
+
+    _processTransformReceive() {
+        if (this._receiveTransformTask !== null) {
+            return this._receiveTransformTask;
+        }
+
+        const transform = this._receiveTransform;
+        const generation = this._transformGeneration;
+        const task = (async () => {
+            while (generation === this._transformGeneration &&
+                   transform === this._receiveTransform) {
+                if (this._transformRQ.length < TRANSFORM_HEADER_LENGTH) {
+                    break;
+                }
+                const length = (this._transformRQ[0] << 8) | this._transformRQ[1];
+                if (length > MAX_TRANSFORM_PLAINTEXT) {
+                    throw new WebsockError(
+                        'integrity-failed', 'The encrypted transport record has a malformed length.');
+                }
+                const recordLength = TRANSFORM_HEADER_LENGTH + length +
+                                     TRANSFORM_TAG_LENGTH;
+                if (this._transformRQ.length < recordLength) {
+                    break;
+                }
+
+                const record = this._transformRQ.slice(0, recordLength);
+                this._transformRQ = this._transformRQ.slice(recordLength);
+                let plaintext;
+                try {
+                    plaintext = await transform.open(record);
+                } catch (error) {
+                    throw new WebsockError(
+                        'integrity-failed', 'The encrypted transport failed to open a record.', error);
+                }
+                if (generation !== this._transformGeneration ||
+                    transform !== this._receiveTransform) {
+                    transform.reset();
+                    return;
+                }
+                if (plaintext === null) {
+                    throw new WebsockError(
+                        'integrity-failed', 'The encrypted transport record failed authentication.');
+                }
+                this._appendReceiveData(plaintext);
+            }
+        })();
+
+        const taskResult = task.catch((error) => {
+            if (generation === this._transformGeneration &&
+                transform === this._receiveTransform) {
+                this._failTransportTransform(error);
+            }
+        });
+        this._receiveTransformTask = taskResult;
+        taskResult.finally(() => {
+            if (this._receiveTransformTask === taskResult) {
+                this._receiveTransformTask = null;
+            }
+        });
+        return taskResult;
+    }
+
+    _failTransportTransform(error) {
+        this.deactivateTransportTransform();
+        this._rQi = 0;
+        this._rQlen = 0;
+        this._eventHandlers.error(error);
+        if (this._websocket !== null &&
+            (this.readyState === 'connecting' || this.readyState === 'open')) {
+            this._websocket.close(1002, "Encrypted transport failure");
         }
     }
 }

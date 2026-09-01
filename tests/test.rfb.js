@@ -1382,6 +1382,160 @@ describe('Remote Frame Buffer protocol client', function () {
                 expect(spy.args[0][0].detail.clean).to.be.false;
             });
 
+            it('should emit connectionfailure once before an unclean disconnect', function () {
+                client._rfbConnectionState = 'connected';
+                const events = [];
+                let failure;
+                client.addEventListener('connectionfailure', (event) => {
+                    events.push('connectionfailure');
+                    failure = event.detail;
+                });
+                client.addEventListener('disconnect', () => events.push('disconnect'));
+
+                client._fail('unexpected failure');
+                client._fail('duplicate failure');
+
+                expect(events).to.deep.equal(['connectionfailure', 'disconnect']);
+                expect(failure).to.deep.equal({
+                    code: 'transport-closed',
+                    message: 'The VNC connection closed unexpectedly.',
+                });
+            });
+
+            it('should preserve a producer-owned typed failure detail', function () {
+                client._rfbConnectionState = 'connecting';
+                const spy = sinon.spy();
+                client.addEventListener('connectionfailure', spy);
+
+                client._fail('policy details for the log', 'policy-rejected', {
+                    securityType: 2,
+                    offeredTypes: [2],
+                });
+
+                expect(spy).to.have.been.calledOnce;
+                expect(spy.firstCall.args[0].detail).to.deep.equal({
+                    code: 'policy-rejected',
+                    message: 'The server does not offer a security type allowed by the configured policy.',
+                    securityType: 2,
+                    offeredTypes: [2],
+                });
+            });
+
+            it('should not emit connectionfailure for a user disconnect', function () {
+                const failure = sinon.spy();
+                const disconnected = sinon.spy();
+                client.addEventListener('connectionfailure', failure);
+                client.addEventListener('disconnect', disconnected);
+
+                client.disconnect();
+                client._socketError(new Error('late channel error'));
+                this.clock.tick(4000);
+
+                expect(failure).not.to.have.been.called;
+                expect(disconnected).to.have.been.calledOnce;
+                expect(disconnected.firstCall.args[0].detail.clean).to.be.true;
+            });
+
+            it('should classify a remote transport close before disconnect', function () {
+                client._rfbConnectionState = 'connected';
+                const events = [];
+                let failure;
+                client.addEventListener('connectionfailure', (event) => {
+                    events.push('connectionfailure');
+                    failure = event.detail;
+                });
+                client.addEventListener('disconnect', (event) => {
+                    events.push('disconnect');
+                    expect(event.detail.clean).to.be.false;
+                });
+
+                client._socketClose({ code: 1006, reason: '' });
+
+                expect(events).to.deep.equal(['connectionfailure', 'disconnect']);
+                expect(failure).to.deep.equal({
+                    code: 'transport-closed',
+                    message: 'The VNC connection closed unexpectedly.',
+                });
+            });
+
+            it('should classify a producer-owned integrity error', function () {
+                const spy = sinon.spy();
+                client.addEventListener('connectionfailure', spy);
+                const error = new Error('implementation-specific cipher text');
+                error.failureCode = 'integrity-failed';
+
+                client._socketError(error);
+
+                expect(spy).to.have.been.calledOnce;
+                expect(spy.firstCall.args[0].detail).to.deep.equal({
+                    code: 'integrity-failed',
+                    message: 'The encrypted VNC connection failed an integrity check.',
+                });
+            });
+
+            it('should classify RSA-AES asynchronous failures without parsing messages', async function () {
+                let rejectAuthentication;
+                const state = {
+                    hasStarted: false,
+                    securityDetails: {},
+                    addEventListener: sinon.spy(),
+                    removeEventListener: sinon.spy(),
+                    checkInternalEvents: sinon.spy(),
+                    negotiateAuthAsync: () => new Promise((resolve, reject) => {
+                        rejectAuthentication = reject;
+                    }),
+                };
+                client._rfbConnectionState = 'connecting';
+                client._rfbAuthScheme = 129;
+                client._rfbSecurityType = 129;
+                client._rfbRSAAESAuthenticationState = state;
+                const failure = new Promise((resolve) => {
+                    client.addEventListener('connectionfailure', resolve, { once: true });
+                });
+
+                client._negotiateRSAAESAuth();
+                const error = new Error('localized or implementation-specific text');
+                error.failureCode = 'integrity-failed';
+                rejectAuthentication(error);
+
+                expect((await failure).detail).to.deep.equal({
+                    code: 'integrity-failed',
+                    message: 'The encrypted VNC connection failed an integrity check.',
+                    securityType: 129,
+                });
+            });
+
+            it('should ignore stale RSA-AES failures after a user disconnect', async function () {
+                let rejectAuthentication;
+                const state = {
+                    hasStarted: false,
+                    securityDetails: {},
+                    addEventListener: sinon.spy(),
+                    removeEventListener: sinon.spy(),
+                    checkInternalEvents: sinon.spy(),
+                    disconnect: sinon.spy(),
+                    negotiateAuthAsync: () => new Promise((resolve, reject) => {
+                        rejectAuthentication = reject;
+                    }),
+                };
+                client._rfbConnectionState = 'connecting';
+                client._rfbAuthScheme = 129;
+                client._rfbSecurityType = 129;
+                client._rfbRSAAESAuthenticationState = state;
+                const failure = sinon.spy();
+                client.addEventListener('connectionfailure', failure);
+
+                client._negotiateRSAAESAuth();
+                client.disconnect();
+                rejectAuthentication(new Error('arbitrary stale failure'));
+                await Promise.resolve();
+                await Promise.resolve();
+                this.clock.tick(4000);
+
+                expect(failure).not.to.have.been.called;
+                expect(client._rfbCleanDisconnect).to.be.true;
+            });
+
         });
     });
 
@@ -1404,6 +1558,46 @@ describe('Remote Frame Buffer protocol client', function () {
 
         function sendSecurity(type, cl) {
             cl._sock._websocket._receiveData(new Uint8Array([1, type]));
+        }
+
+        function sendServerInit(opts, cl) {
+            const fullOpts = { width: 10, height: 12, bpp: 24, depth: 24, bigEndian: 0,
+                               trueColor: 1, redMax: 255, greenMax: 255, blueMax: 255,
+                               redShift: 16, greenShift: 8, blueShift: 0, name: 'a name' };
+            for (let opt in opts) {
+                fullOpts[opt] = opts[opt];
+            }
+            const data = [];
+
+            push16(data, fullOpts.width);
+            push16(data, fullOpts.height);
+
+            data.push(fullOpts.bpp);
+            data.push(fullOpts.depth);
+            data.push(fullOpts.bigEndian);
+            data.push(fullOpts.trueColor);
+
+            push16(data, fullOpts.redMax);
+            push16(data, fullOpts.greenMax);
+            push16(data, fullOpts.blueMax);
+            push8(data, fullOpts.redShift);
+            push8(data, fullOpts.greenShift);
+            push8(data, fullOpts.blueShift);
+
+            // padding
+            push8(data, 0);
+            push8(data, 0);
+            push8(data, 0);
+
+            cl._sock._websocket._receiveData(new Uint8Array(data));
+
+            const nameData = [];
+            const nameLen = [];
+            pushString(nameData, fullOpts.name);
+            push32(nameLen, nameData.length);
+
+            cl._sock._websocket._receiveData(new Uint8Array(nameLen));
+            cl._sock._websocket._receiveData(new Uint8Array(nameData));
         }
 
         describe('ProtocolVersion', function () {
@@ -1505,19 +1699,136 @@ describe('Remote Frame Buffer protocol client', function () {
                 client._sock._websocket._getSentData();
             });
 
-            it('should respect server preference order', function () {
+            it('should negotiate every public RSA-AES wire type', function () {
+                const variants = [
+                    [5, 'RA2', 128, true],
+                    [6, 'RA2ne', 128, false],
+                    [13, 'RA2r', 128, true],
+                    [129, 'RA2_256', 256, true],
+                    [130, 'RA2ne_256', 256, false],
+                    [133, 'RA2r_256', 256, true],
+                ];
+
+                for (const [type, name, aesBits, sessionEncrypted] of variants) {
+                    const variantClient = makeRFB();
+                    variantClient._rfbConnectionState = 'connecting';
+                    sendVer('003.008\n', variantClient);
+                    variantClient._sock._websocket._getSentData();
+                    sendSecurity(type, variantClient);
+
+                    expect(variantClient._sock).to.have.sent(new Uint8Array([type]));
+                    expect(variantClient._rfbAuthScheme).to.equal(type);
+                    expect(variantClient._rfbNegotiatedSecurity).to.equal(null);
+                    expect(variantClient._rfbRSAAESAuthenticationState.securityDetails)
+                        .to.deep.equal({
+                            type,
+                            name,
+                            authenticationEncrypted: true,
+                            sessionEncrypted,
+                            aesBits,
+                        });
+                }
+            });
+
+            it('should respect server preference order when security policy is omitted', function () {
                 const authSchemes = [ 6, 79, 30, 188, 16, 6, 1 ];
                 client._sock._websocket._receiveData(new Uint8Array(authSchemes));
                 expect(client._sock).to.have.sent(new Uint8Array([30]));
             });
 
+            it('should preserve server preference order when security policy has no groups', function () {
+                const policyClient = makeRFB('wss://host:8675', {
+                    securityPolicy: [],
+                });
+                policyClient._rfbConnectionState = 'connecting';
+                sendVer('003.008\n', policyClient);
+                policyClient._sock._websocket._getSentData();
+
+                policyClient._sock._websocket._receiveData(
+                    new Uint8Array([2, 2, 1]));
+
+                expect(policyClient._sock).to.have.sent(new Uint8Array([2]));
+            });
+
+            it('should apply ordered security policy groups and preserve server order within a group', function () {
+                const policyClient = makeRFB('wss://host:8675', {
+                    securityPolicy: [[5, 129], [6, 2]],
+                });
+                policyClient._rfbConnectionState = 'connecting';
+                sendVer('003.008\n', policyClient);
+                policyClient._sock._websocket._getSentData();
+
+                policyClient._sock._websocket._receiveData(
+                    new Uint8Array([4, 6, 129, 5, 2]));
+
+                expect(policyClient._sock).to.have.sent(new Uint8Array([129]));
+            });
+
+            it('should fail explicitly when no offered type matches a strict security policy', function () {
+                const policyClient = makeRFB('wss://host:8675', {
+                    securityPolicy: [[5, 129]],
+                });
+                policyClient._rfbConnectionState = 'connecting';
+                const events = [];
+                let failure;
+                policyClient.addEventListener('connectionfailure', (event) => {
+                    events.push('connectionfailure');
+                    failure = event.detail;
+                });
+                policyClient.addEventListener('disconnect', () => events.push('disconnect'));
+                policyClient.addEventListener('negotiatedsecurity', () => events.push('negotiatedsecurity'));
+                policyClient.addEventListener('connect', () => events.push('connect'));
+                sendVer('003.008\n', policyClient);
+                policyClient._sock._websocket._getSentData();
+
+                policyClient._sock._websocket._receiveData(
+                    new Uint8Array([2, 6, 2]));
+
+                expect(events).to.deep.equal(['connectionfailure', 'disconnect']);
+                expect(failure).to.deep.equal({
+                    code: 'policy-rejected',
+                    message: 'The server does not offer a security type allowed by the configured policy.',
+                    offeredTypes: [6, 2],
+                });
+            });
+
+            it('should fail explicitly when an RFB 3.3 server selects a type outside a strict security policy', function () {
+                const policyClient = makeRFB('wss://host:8675', {
+                    securityPolicy: [[5, 129]],
+                });
+                policyClient._rfbConnectionState = 'connecting';
+                const spy = sinon.spy();
+                policyClient.addEventListener('connectionfailure', spy);
+                sendVer('003.003\n', policyClient);
+                policyClient._sock._websocket._getSentData();
+
+                policyClient._sock._websocket._receiveData(
+                    new Uint8Array([0, 0, 0, 2]));
+
+                expect(spy).to.have.been.calledOnce;
+                expect(spy.firstCall.args[0].detail).to.deep.equal({
+                    code: 'policy-rejected',
+                    message: 'The server does not offer a security type allowed by the configured policy.',
+                    securityType: 2,
+                    offeredTypes: [2],
+                });
+            });
+
             it('should fail if there are no supported schemes', function () {
+                const failure = sinon.spy();
                 let callback = sinon.spy();
+                client.addEventListener('connectionfailure', failure);
                 client.addEventListener("disconnect", callback);
 
                 const authSchemes = [1, 32];
                 client._sock._websocket._receiveData(new Uint8Array(authSchemes));
 
+                expect(failure).to.have.been.calledOnce;
+                expect(failure.firstCall.args[0].detail).to.deep.equal({
+                    code: 'unsupported-security-type',
+                    message: 'The server does not offer a supported security type.',
+                    offeredTypes: [32],
+                });
                 expect(callback).to.have.been.calledOnce;
                 expect(callback.args[0][0].detail.clean).to.be.false;
             });
@@ -1571,6 +1882,24 @@ describe('Remote Frame Buffer protocol client', function () {
 
                 client._sock._websocket._receiveData(new Uint8Array([0, 0, 0, 1]));
                 expect(client._rfbInitState).to.equal('ServerInitialisation');
+            });
+
+            it('should accept an RFB 3.3 server type allowed by a strict policy and report it', function () {
+                const policyClient = makeRFB('wss://host:8675', {
+                    securityPolicy: [[1]],
+                });
+                policyClient._rfbConnectionState = 'connecting';
+                const spy = sinon.spy();
+                policyClient.addEventListener('negotiatedsecurity', spy);
+                sendVer('003.003\n', policyClient);
+                policyClient._sock._websocket._getSentData();
+
+                policyClient._sock._websocket._receiveData(
+                    new Uint8Array([0, 0, 0, 1]));
+
+                expect(policyClient._rfbInitState).to.equal('ServerInitialisation');
+                expect(spy).to.have.been.calledOnce;
+                expect(spy.args[0][0].detail.type).to.equal(1);
             });
 
             it('should transition straight to ServerInitialisation on "no auth" for versions < 3.8', function () {
@@ -2392,6 +2721,36 @@ describe('Remote Frame Buffer protocol client', function () {
                     expect(client._rfbAuthScheme).to.equal(2);
                 });
 
+                it('should keep Tight UnixLogon distinct from top-level RA2_256', function () {
+                    sendNumStrPairs([[0, 'TGHT', 'NOTUNNEL']], client);
+                    client._sock._websocket._getSentData();
+                    sendNumStrPairs([[129, 'TGHT', 'ULGNAUTH']], client);
+
+                    expect(client._sock).to.have.sent(new Uint8Array([0, 0, 0, 129]));
+                    expect(client._rfbAuthScheme).to.equal('TightUnixLogon');
+                    expect(client._rfbRSAAESAuthenticationState).to.equal(null);
+                });
+
+                it('should report Tight UnixLogon as top-level Tight, not RA2_256', function () {
+                    const spy = sinon.spy();
+                    client.addEventListener('negotiatedsecurity', spy);
+                    client.sendCredentials({ username: 'user', password: 'password' });
+                    sendNumStrPairs([[0, 'TGHT', 'NOTUNNEL']], client);
+                    client._sock._websocket._getSentData();
+                    sendNumStrPairs([[129, 'TGHT', 'ULGNAUTH']], client);
+                    clock.tick();
+
+                    client._sock._websocket._receiveData(new Uint8Array([0, 0, 0, 0]));
+
+                    expect(spy).to.have.been.calledOnce;
+                    expect(spy.args[0][0].detail).to.deep.equal({
+                        type: 16,
+                        name: 'Tight',
+                        authenticationEncrypted: false,
+                        sessionEncrypted: false,
+                    });
+                });
+
                 it('should fail if there are no supported auth types', function () {
                     let callback = sinon.spy();
                     client.addEventListener("disconnect", callback);
@@ -2603,15 +2962,91 @@ describe('Remote Frame Buffer protocol client', function () {
                 expect(client._rfbInitState).to.equal('ServerInitialisation');
             });
 
-            it('should include reason when provided in securityfailure event', function () {
+            it('should emit negotiatedsecurity exactly once after authentication succeeds', function () {
+                const policyClient = makeRFB('wss://host:8675', {
+                    securityPolicy: [[129], [1]],
+                });
+                policyClient._rfbConnectionState = 'connecting';
+                sendVer('003.008\n', policyClient);
+                policyClient._sock._websocket._getSentData();
+                sendSecurity(1, policyClient);
+                policyClient._sock._websocket._getSentData();
+                const events = [];
+                policyClient.addEventListener('negotiatedsecurity', (event) => {
+                    events.push(event.detail);
+                });
+
+                policyClient._sock._websocket._receiveData(
+                    new Uint8Array([0, 0, 0, 0]));
+                policyClient._dispatchNegotiatedSecurity();
+
+                expect(events).to.deep.equal([{
+                    type: 1,
+                    name: 'None',
+                    authenticationEncrypted: false,
+                    sessionEncrypted: false,
+                }]);
+                expect(policyClient._rfbInitState).to.equal('ServerInitialisation');
+            });
+
+            it('should emit negotiatedsecurity before the normal connect event', function () {
+                const events = [];
+                client.addEventListener('negotiatedsecurity', () => events.push('security'));
+                client.addEventListener('connect', () => events.push('connect'));
+                client._sock._websocket._receiveData(new Uint8Array([0, 0, 0, 0]));
+                sendServerInit({}, client);
+
+                expect(events).to.deep.equal(['security', 'connect']);
+            });
+
+            it('should emit the stable RSA-AES authentication result detail', function () {
                 const spy = sinon.spy();
-                client.addEventListener("securityfailure", spy);
+                const details = Object.freeze({
+                    type: 129,
+                    name: 'RA2_256',
+                    authenticationEncrypted: true,
+                    sessionEncrypted: true,
+                    aesBits: 256,
+                });
+                client._rfbSecurityType = 129;
+                client._rfbNegotiatedSecurity = details;
+                client.addEventListener('negotiatedsecurity', spy);
+
+                client._sock._websocket._receiveData(new Uint8Array([0, 0, 0, 0]));
+
+                expect(spy).to.have.been.calledOnce;
+                expect(spy.args[0][0].detail).to.equal(details);
+            });
+
+            it('should preserve securityfailure before a typed authentication failure', function () {
+                const events = [];
+                let securityFailure;
+                let connectionFailure;
+                client.addEventListener('securityfailure', (event) => {
+                    events.push('securityfailure');
+                    securityFailure = event.detail;
+                });
+                client.addEventListener('connectionfailure', (event) => {
+                    events.push('connectionfailure');
+                    connectionFailure = event.detail;
+                });
+                client.addEventListener('disconnect', () => events.push('disconnect'));
+                client.addEventListener('negotiatedsecurity', () => events.push('negotiatedsecurity'));
+                client.addEventListener('connect', () => events.push('connect'));
                 const failureData = [0, 0, 0, 1, 0, 0, 0, 12, 115, 117, 99, 104,
                                      32, 102, 97, 105, 108, 117, 114, 101];
+
                 client._sock._websocket._receiveData(new Uint8Array(failureData));
-                expect(spy).to.have.been.calledOnce;
-                expect(spy.args[0][0].detail.status).to.equal(1);
-                expect(spy.args[0][0].detail.reason).to.equal('such failure');
+
+                expect(events).to.deep.equal([
+                    'securityfailure', 'connectionfailure', 'disconnect',
+                ]);
+                expect(securityFailure).to.deep.equal({ status: 1, reason: 'such failure' });
+                expect(connectionFailure).to.deep.equal({
+                    code: 'authentication-failed',
+                    message: 'VNC authentication failed.',
+                    securityType: 1,
+                });
             });
 
             it('should not include reason when length is zero in securityfailure event', function () {
@@ -2655,46 +3090,6 @@ describe('Remote Frame Buffer protocol client', function () {
             beforeEach(function () {
                 client._rfbInitState = 'ServerInitialisation';
             });
-
-            function sendServerInit(opts, client) {
-                const fullOpts = { width: 10, height: 12, bpp: 24, depth: 24, bigEndian: 0,
-                                   trueColor: 1, redMax: 255, greenMax: 255, blueMax: 255,
-                                   redShift: 16, greenShift: 8, blueShift: 0, name: 'a name' };
-                for (let opt in opts) {
-                    fullOpts[opt] = opts[opt];
-                }
-                const data = [];
-
-                push16(data, fullOpts.width);
-                push16(data, fullOpts.height);
-
-                data.push(fullOpts.bpp);
-                data.push(fullOpts.depth);
-                data.push(fullOpts.bigEndian);
-                data.push(fullOpts.trueColor);
-
-                push16(data, fullOpts.redMax);
-                push16(data, fullOpts.greenMax);
-                push16(data, fullOpts.blueMax);
-                push8(data, fullOpts.redShift);
-                push8(data, fullOpts.greenShift);
-                push8(data, fullOpts.blueShift);
-
-                // padding
-                push8(data, 0);
-                push8(data, 0);
-                push8(data, 0);
-
-                client._sock._websocket._receiveData(new Uint8Array(data));
-
-                const nameData = [];
-                let nameLen = [];
-                pushString(nameData, fullOpts.name);
-                push32(nameLen, nameData.length);
-
-                client._sock._websocket._receiveData(new Uint8Array(nameLen));
-                client._sock._websocket._receiveData(new Uint8Array(nameData));
-            }
 
             it('should set the framebuffer width and height', function () {
                 sendServerInit({ width: 32, height: 84 }, client);

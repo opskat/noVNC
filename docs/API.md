@@ -104,6 +104,10 @@ protocol stream.
   - The `connect` event is fired when the `RFB` object has completed
     the connection and handshaking with the server.
 
+[`connectionfailure`](#connectionfailure)
+  - The `connectionfailure` event is fired once before an unclean
+    disconnection and identifies the failure using a stable code.
+
 [`credentialsrequired`](#credentialsrequired)
   - The `credentialsrequired` event is fired when more credentials must
     be given to continue.
@@ -114,6 +118,10 @@ protocol stream.
 
 [`disconnect`](#disconnect)
   - The `disconnect` event is fired when the `RFB` object disconnects.
+
+[`negotiatedsecurity`](#negotiatedsecurity)
+  - The `negotiatedsecurity` event is fired once authentication has
+    succeeded, before the connection is fully established.
 
 [`securityfailure`](#securityfailure)
   - The `securityfailure` event is fired when the security negotiation
@@ -223,6 +231,16 @@ new RFB(target, urlOrChannel, options);
       - A `DOMString` specifying the ID to provide to any VNC repeater
         encountered.
 
+    `securityPolicy`
+      - An ordered `Array` of preference groups, where each group is an
+        `Array` of numeric RFB security types. The first group containing a
+        server-offered supported type is selected, preserving server order
+        within that group. Omitting this option or supplying an empty array
+        preserves unrestricted server-order negotiation. If no offered type
+        matches a non-empty policy, the connection fails instead of falling
+        back outside the policy. RFB 3.3 servers choose the security type, and
+        the client rejects a server-selected type outside a non-empty policy.
+
     `wsProtocols`
       - An `Array` of `DOMString`s specifying the sub-protocols to use
         in the WebSocket connection. Empty by default.
@@ -263,6 +281,38 @@ The `connect` event is fired after all the handshaking with the server
 is completed and the connection is fully established. After this event
 the `RFB` object is ready to recieve graphics updates and to send input.
 
+#### connectionfailure
+
+The `connectionfailure` event is fired exactly once before the
+[`disconnect`](#disconnect) event for an unclean connection termination. It is
+not fired for a clean termination initiated by [`RFB.disconnect()`](#rfbdisconnect).
+After this event, the failed connection will not emit a later
+[`negotiatedsecurity`](#negotiatedsecurity) or [`connect`](#connect) event.
+
+The `detail` property is an `Object` containing:
+
+| Property | Type | Description
+| -------- | ---- | -----------
+| `code` | `DOMString` | Stable machine-readable failure code
+| `message` | `DOMString` | Stable human-readable English summary
+| `securityType` | `long` | Optional numeric security type selected or rejected
+| `offeredTypes` | `Array` of `long` | Optional server-offered security types
+
+The following codes and messages are defined:
+
+| Code | Message | Meaning
+| ---- | ------- | -------
+| `policy-rejected` | `The server does not offer a security type allowed by the configured policy.` | A non-empty `securityPolicy` excludes every server-offered type
+| `unsupported-security-type` | `The server does not offer a supported security type.` | No server-offered type is implemented by the client
+| `authentication-failed` | `VNC authentication failed.` | Security negotiation or credential authentication failed
+| `integrity-failed` | `The encrypted VNC connection failed an integrity check.` | An encrypted record was malformed, could not be processed, or failed authentication
+| `transport-closed` | `The VNC connection closed unexpectedly.` | The WebSocket or data channel failed or closed unexpectedly
+
+The existing [`securityfailure`](#securityfailure) event remains available for
+RFB `SecurityResult` status and server-provided reason details. When both events
+apply, `securityfailure` is fired first, followed by `connectionfailure`, then
+an unclean `disconnect`.
+
 #### desktopname
 
 The `desktopname` event is fired when the name of the remote desktop
@@ -276,6 +326,23 @@ terminated. The `detail` property is an `Object` that contains the
 property `clean`. `clean` is a `boolean` indicating if the termination
 was clean or not. In the event of an unexpected termination or an error
 `clean` will be set to false.
+
+#### negotiatedsecurity
+
+The `negotiatedsecurity` event is fired exactly once after authentication
+succeeds and before the [`connect`](#connect) event. The `detail` property
+reports the security type actually negotiated, not the configured preference:
+
+| Property | Type        | Description
+| -------- | ----------- | -----------
+| `type` | `long` | Numeric top-level RFB security type selected on the wire
+| `name` | `DOMString` | Stable protocol name, such as `None`, `VNCAuth`, `Tight`, `RA2`, `RA2ne`, `RA2r`, `RA2_256`, `RA2ne_256`, or `RA2r_256`
+| `authenticationEncrypted` | `boolean` | Whether authentication credentials were cryptographically protected
+| `sessionEncrypted` | `boolean` | Whether the post-authentication RFB transport is encrypted
+| `aesBits` | `long` | AES key size for RSA-AES security types; omitted for other types
+
+Top-level type 129 is reported as `RA2_256`. Tight UnixLogon remains a Tight
+subtype and is reported using top-level type 16 with the name `Tight`.
 
 #### securityfailure
 

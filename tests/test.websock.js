@@ -1,3 +1,4 @@
+import RA2RecordCipher from '../core/ra2_cipher.js';
 import Websock from '../core/websock.js';
 import FakeWebSocket from './fake.websocket.js';
 
@@ -546,6 +547,330 @@ describe('Websock', function () {
         after(function () {
             // eslint-disable-next-line no-global-assign
             WebSocket = oldWS;
+        });
+    });
+
+    describe('transport transform', function () {
+        let sock, websock;
+
+        function nextTask() {
+            return new Promise(resolve => setTimeout(resolve, 0));
+        }
+
+        function makeRecord(data) {
+            const record = new Uint8Array(data.length + 18);
+            record[0] = data.length >> 8;
+            record[1] = data.length;
+            record.set(data, 2);
+            return record;
+        }
+
+        async function makeCipher(key) {
+            const cipher = new RA2RecordCipher();
+            await cipher.setKey(key);
+            return cipher;
+        }
+
+        beforeEach(function () {
+            sock = new Websock();
+            websock = new FakeWebSocket();
+            websock._open();
+            sock.attach(websock);
+        });
+
+        it('should publish fragmented and coalesced records as continuous plaintext', async function () {
+            const key = new Uint8Array(16).map((_, i) => i);
+            const sender = await makeCipher(key);
+            const receiver = await makeCipher(key);
+            const records = await Promise.all([
+                sender.seal(new Uint8Array([1, 2])),
+                sender.seal(new Uint8Array([3, 4, 5])),
+                sender.seal(new Uint8Array([6])),
+            ]);
+            const wire = new Uint8Array(records.reduce((sum, record) => sum + record.length, 0));
+            let offset = 0;
+            for (const record of records) {
+                wire.set(record, offset);
+                offset += record.length;
+            }
+            const messages = sinon.spy();
+            sock.on('message', messages);
+            sock.activateTransportTransform(null, receiver);
+
+            websock.onmessage(new MessageEvent('message', { data: wire.slice(0, 7).buffer }));
+            await nextTask();
+            expect(sock.rQlen()).to.equal(0);
+            websock.onmessage(new MessageEvent('message', { data: wire.slice(7).buffer }));
+            await nextTask();
+            await nextTask();
+
+            expect(sock.rQshiftBytes(6)).to.array.equal(new Uint8Array([1, 2, 3, 4, 5, 6]));
+            expect(messages).to.have.been.calledThrice;
+        });
+
+        it('should treat unread bytes as ciphertext when activated', async function () {
+            const key = new Uint8Array(16).map((_, i) => i);
+            const sender = await makeCipher(key);
+            const receiver = await makeCipher(key);
+            const record = await sender.seal(new Uint8Array([9, 8, 7]));
+            const messages = sinon.spy();
+            sock.on('message', messages);
+
+            websock.onmessage(new MessageEvent('message', { data: record.buffer }));
+            messages.resetHistory();
+            sock.activateTransportTransform(null, receiver);
+            await nextTask();
+
+            expect(sock.rQshiftBytes(3)).to.array.equal(new Uint8Array([9, 8, 7]));
+            expect(messages).to.have.been.calledOnce;
+        });
+
+        it('should split outbound plaintext into serialized 8192-byte records', async function () {
+            let active = 0;
+            let maxActive = 0;
+            const lengths = [];
+            const transform = {
+                seal: async (plaintext) => {
+                    active++;
+                    maxActive = Math.max(maxActive, active);
+                    await nextTask();
+                    lengths.push(plaintext.length);
+                    active--;
+                    return makeRecord(plaintext);
+                },
+                reset: sinon.spy(),
+            };
+            sock.activateTransportTransform(transform, null);
+            sock.sQpushBytes(new Uint8Array(9000).map((_, i) => i));
+
+            await sock.flush();
+
+            expect(lengths).to.deep.equal([8192, 808]);
+            expect(maxActive).to.equal(1);
+            const sent = websock._getSentData();
+            expect(sent.length).to.equal(9000 + 36);
+            expect(sent.slice(2, 8194)).to.array.equal(new Uint8Array(8192).map((_, i) => i));
+            expect(sent.slice(8194 + 18, 8194 + 18 + 808)).to.array.equal(
+                new Uint8Array(808).map((_, i) => i));
+        });
+
+        it('should let an empty flush wait for pending transformation', async function () {
+            let resolveSeal;
+            const transform = {
+                seal: () => new Promise((resolve) => { resolveSeal = resolve; }),
+                reset: sinon.spy(),
+            };
+            sock.activateTransportTransform(transform, null);
+            sock.sQpushBytes(new Uint8Array([1]));
+            sock.flush();
+            const settled = sinon.spy();
+            const pending = sock.flush().then(settled);
+            await nextTask();
+
+            expect(settled).not.to.have.been.called;
+            resolveSeal(makeRecord(new Uint8Array([1])));
+            await pending;
+            expect(settled).to.have.been.calledOnce;
+        });
+
+        it('should preserve queued plaintext while an earlier flush is pending', async function () {
+            const plaintext = [];
+            const transform = {
+                seal: async (data) => {
+                    await nextTask();
+                    plaintext.push(data.slice());
+                    return makeRecord(data);
+                },
+                reset: sinon.spy(),
+            };
+            sock.activateTransportTransform(transform, null);
+            sock.sQpushBytes(new Uint8Array([1]));
+            const firstFlush = sock.flush();
+            sock.sQpushBytes(new Uint8Array([2]));
+            const secondFlush = sock.flush();
+
+            await Promise.all([firstFlush, secondFlush]);
+
+            expect(plaintext[0]).to.array.equal(new Uint8Array([1]));
+            expect(plaintext[1]).to.array.equal(new Uint8Array([2]));
+        });
+
+        it('should serialize asynchronous record decryption', async function () {
+            const resolvers = [];
+            const calls = [];
+            const transform = {
+                open: (record) => {
+                    calls.push(record[2]);
+                    return new Promise(resolve => resolvers.push(() => resolve(record.slice(2, 3))));
+                },
+                reset: sinon.spy(),
+            };
+            sock.activateTransportTransform(null, transform);
+            const first = makeRecord(new Uint8Array([1]));
+            const second = makeRecord(new Uint8Array([2]));
+            const wire = new Uint8Array(first.length + second.length);
+            wire.set(first);
+            wire.set(second, first.length);
+
+            websock.onmessage(new MessageEvent('message', { data: wire.buffer }));
+            await nextTask();
+            expect(calls).to.deep.equal([1]);
+            resolvers.shift()();
+            await nextTask();
+            expect(calls).to.deep.equal([1, 2]);
+            resolvers.shift()();
+            await nextTask();
+            expect(sock.rQshiftBytes(2)).to.array.equal(new Uint8Array([1, 2]));
+        });
+
+        it('should fail closed on malformed records and asynchronous errors', async function () {
+            const errors = sinon.spy();
+            const messages = sinon.spy();
+            sock.on('error', errors);
+            sock.on('message', messages);
+            sock.activateTransportTransform(null, {
+                open: async () => { throw new Error('bad MAC'); },
+                reset: sinon.spy(),
+            });
+
+            websock.onmessage(new MessageEvent('message', { data: makeRecord(new Uint8Array([1])).buffer }));
+            await nextTask();
+
+            expect(errors).to.have.been.calledOnce;
+            expect(errors.firstCall.args[0].failureCode).to.equal('integrity-failed');
+            expect(messages).not.to.have.been.called;
+            expect(websock.readyState).to.equal(WebSocket.CLOSED);
+            expect(sock.rQlen()).to.equal(0);
+        });
+
+        it('should fail closed when authentication returns no plaintext', async function () {
+            const errors = sinon.spy();
+            const messages = sinon.spy();
+            sock.on('error', errors);
+            sock.on('message', messages);
+            sock.activateTransportTransform(null, {
+                open: async () => null,
+                reset: sinon.spy(),
+            });
+
+            websock.onmessage(new MessageEvent('message', {
+                data: makeRecord(new Uint8Array([1])).buffer,
+            }));
+            await nextTask();
+
+            expect(errors).to.have.been.calledOnce;
+            expect(errors.firstCall.args[0].failureCode).to.equal('integrity-failed');
+            expect(messages).not.to.have.been.called;
+            expect(websock.readyState).to.equal(WebSocket.CLOSED);
+        });
+
+        it('should fail closed on encryption and channel send errors', async function () {
+            const encryptionErrors = sinon.spy();
+            sock.on('error', encryptionErrors);
+            sock.activateTransportTransform({
+                seal: async () => { throw new Error('encryption failed'); },
+                reset: sinon.spy(),
+            }, null);
+            sock.sQpushBytes(new Uint8Array([1]));
+
+            await sock.flush();
+
+            expect(encryptionErrors).to.have.been.calledOnce;
+            expect(encryptionErrors.firstCall.args[0].failureCode).to.equal('integrity-failed');
+            expect(websock.readyState).to.equal(WebSocket.CLOSED);
+
+            sock = new Websock();
+            websock = new FakeWebSocket();
+            websock._open();
+            sock.attach(websock);
+            const channelErrors = sinon.spy();
+            sock.on('error', channelErrors);
+            websock.send = sinon.stub().throws(new Error('channel failed'));
+            sock.activateTransportTransform({
+                seal: async data => makeRecord(data),
+                reset: sinon.spy(),
+            }, null);
+            sock.sQpushBytes(new Uint8Array([2]));
+
+            await sock.flush();
+
+            expect(channelErrors).to.have.been.calledOnce;
+            expect(channelErrors.firstCall.args[0].failureCode).to.equal('transport-closed');
+            expect(websock.readyState).to.equal(WebSocket.CLOSED);
+        });
+
+        it('should reject oversized record lengths without invoking decryption', async function () {
+            const errors = sinon.spy();
+            const transform = { open: sinon.spy(), reset: sinon.spy() };
+            sock.on('error', errors);
+            sock.activateTransportTransform(null, transform);
+
+            websock.onmessage(new MessageEvent('message', {
+                data: new Uint8Array([0x20, 0x01]).buffer,
+            }));
+            await nextTask();
+
+            expect(transform.open).not.to.have.been.called;
+            expect(errors).to.have.been.calledOnce;
+            expect(errors.firstCall.args[0].failureCode).to.equal('integrity-failed');
+            expect(websock.readyState).to.equal(WebSocket.CLOSED);
+        });
+
+        it('should not send pending transformed data after disconnect', async function () {
+            let resolveSeal;
+            const transform = {
+                seal: () => new Promise((resolve) => { resolveSeal = resolve; }),
+                reset: sinon.spy(),
+            };
+            sock.activateTransportTransform(transform, null);
+            sock.sQpushBytes(new Uint8Array([1, 2, 3]));
+            const flushed = sock.flush();
+            await nextTask();
+
+            sock.close();
+            resolveSeal(makeRecord(new Uint8Array([1, 2, 3])));
+            await flushed;
+
+            expect(websock._getSentData()).to.array.equal(new Uint8Array());
+            expect(transform.reset).to.have.been.called;
+        });
+
+        it('should discard pending plaintext when the raw channel disconnects', async function () {
+            let resolveOpen;
+            const messages = sinon.spy();
+            const transform = {
+                open: () => new Promise((resolve) => { resolveOpen = resolve; }),
+                reset: sinon.spy(),
+            };
+            sock.on('message', messages);
+            sock.activateTransportTransform(null, transform);
+            websock.onmessage(new MessageEvent('message', {
+                data: makeRecord(new Uint8Array([1])).buffer,
+            }));
+            await nextTask();
+
+            websock.close();
+            resolveOpen(new Uint8Array([1]));
+            await nextTask();
+
+            expect(messages).not.to.have.been.called;
+            expect(sock.rQlen()).to.equal(0);
+            expect(transform.reset).to.have.been.called;
+        });
+
+        it('should deactivate the transform and restore raw transport', async function () {
+            const send = { seal: sinon.spy(), reset: sinon.spy() };
+            const receive = { open: sinon.spy(), reset: sinon.spy() };
+            sock.activateTransportTransform(send, receive);
+            sock.deactivateTransportTransform();
+            sock.sQpushBytes(new Uint8Array([1, 2, 3]));
+
+            await sock.flush();
+
+            expect(sock).to.have.sent(new Uint8Array([1, 2, 3]));
+            expect(send.seal).not.to.have.been.called;
+            expect(send.reset).to.have.been.calledOnce;
+            expect(receive.reset).to.have.been.calledOnce;
         });
     });
 
